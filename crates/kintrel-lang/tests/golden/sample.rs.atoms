@@ -1,0 +1,27 @@
+sample.rs	0..46,87..88,101..102,133..134,153..155,254..307,607..609,763..765,899..901,965..967,977..979,1028..1030,1052..1053,1085..1086,1104..1105,1131..1133,1170..1171	//! Module docs stay in the file-level atom.
+sample.rs::use std%3A%3Acollections	46..87	use std::collections::{HashMap, HashSet};
+sample.rs::use std%3A%3Afmt	88..101	use std::fmt;
+sample.rs::use crate%3A%3Acart%3A%3ACart as C	102..133	pub use crate::cart::Cart as C;
+sample.rs::use serde	134..153	extern crate serde;
+sample.rs::struct Line	155..254	pub struct Line { pub sku: String, pub qty: u32, }
+sample.rs::impl Line	307..347,347..353,377..383,537..543,605..607	impl Line
+sample.rs::impl Line::const MAX	353..377	pub const MAX: u32 = 99;
+sample.rs::impl Line::fn price	383..537	pub fn price(&self) -> u64
+sample.rs::impl Line::fn price#1	543..605	pub fn price(&self, currency: &str) -> u64
+sample.rs::impl fmt%3A%3ADisplay for Wrapper<T>	609..657,657..663,761..763	impl<T: fmt::Debug> fmt::Display for Wrapper<T>
+sample.rs::impl fmt%3A%3ADisplay for Wrapper<T>::fn fmt	663..761	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+sample.rs::trait Priced	765..782,782..788,799..804,820..825,848..853,897..899	pub trait Priced
+sample.rs::trait Priced::type Money	788..799	type Money;
+sample.rs::trait Priced::const ZERO	804..820	const ZERO: u64;
+sample.rs::trait Priced::fn price	825..848	fn price(&self) -> u64;
+sample.rs::trait Priced::fn double	853..897	fn double(&self) -> u64
+sample.rs::mod inner	901..911,911..917,930..935,963..965	mod inner
+sample.rs::mod inner::fn f	917..930	pub fn f()
+sample.rs::mod inner::mod deeper	935..963	mod deeper { pub fn g()
+sample.rs::mod outer	967..977	mod outer;
+sample.rs::macro square	979..1028	macro_rules! square { ($x:expr) => { $x * $x }; }
+sample.rs::static COUNT	1030..1052	static COUNT: u32 = 0;
+sample.rs::type Map	1053..1085	type Map = HashMap<String, u32>;
+sample.rs::enum Kind	1086..1104	enum Kind { A, B }
+sample.rs::union U	1105..1131	union U { a: u32, b: f32 }
+sample.rs::fn main	1133..1170	fn main()

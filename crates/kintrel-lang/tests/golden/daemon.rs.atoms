@@ -1,0 +1,37 @@
+daemon.rs	0..302,343..344,377..378,390..391,429..430,461..462,507..508,536..537,577..579,618..619,648..649,687..688,766..767,808..809,895..896,917..918,950..951,973..974,1017..1019,1061..1063,1140..1142,1235..1237,2864..2866,3628..3630,3730..3732,4228..4230,10772..10774,10928..10930,11100..11102,11253..11254	//! `kintreld`: one daemon per board, serving JSON
+daemon.rs::use std%3A%3Acollections	302..343	use std::collections::{HashMap, HashSet};
+daemon.rs::use std%3A%3Afs	344..377	use std::fs::{self, Permissions};
+daemon.rs::use std%3A%3Aio	378..390	use std::io;
+daemon.rs::use std%3A%3Aos%3A%3Aunix%3A%3Afs%3A%3APermissionsExt	391..429	use std::os::unix::fs::PermissionsExt;
+daemon.rs::use std%3A%3Apath	430..461	use std::path::{Path, PathBuf};
+daemon.rs::use std%3A%3Async%3A%3Aatomic	462..507	use std::sync::atomic::{AtomicU64, Ordering};
+daemon.rs::use std%3A%3Async	508..536	use std::sync::{Arc, Mutex};
+daemon.rs::use std%3A%3Atime	537..577	use std::time::{SystemTime, UNIX_EPOCH};
+daemon.rs::use kintrel_core%3A%3Astate	579..618	use kintrel_core::state::{self, State};
+daemon.rs::use kintrel_core%3A%3Atree%3A%3AKind	619..648	use kintrel_core::tree::Kind;
+daemon.rs::use kintrel_core	649..687	use kintrel_core::{Hash, blob, board};
+daemon.rs::use kintrel_core%3A%3Alog	688..766	use kintrel_core::log::{AppendError, Durability, LogWriter, 
+daemon.rs::use kintrel_core%3A%3Apath%3A%3Ais_safe_rel_path	767..808	use kintrel_core::path::is_safe_rel_path;
+daemon.rs::use kintrel_core%3A%3Aproto	809..895	use kintrel_core::proto::{self, MAX_BLOB, MAX_OPS, Request, 
+daemon.rs::use serde%3A%3ASerialize	896..917	use serde::Serialize;
+daemon.rs::use serde%3A%3Ade%3A%3ADeserializeOwned	918..950	use serde::de::DeserializeOwned;
+daemon.rs::use serde_json%3A%3AValue	951..973	use serde_json::Value;
+daemon.rs::use tokio%3A%3Anet	974..1017	use tokio::net::{UnixListener, UnixStream};
+daemon.rs::use crate%3A%3Arpc	1019..1061	use crate::rpc::{read_frame, write_frame};
+daemon.rs::struct Options	1063..1140	pub struct Options { pub repo: PathBuf, pub durability: Dura
+daemon.rs::fn socket_path	1142..1235	pub fn socket_path(repo: &Path) -> PathBuf
+daemon.rs::fn run	1237..2864	pub async fn run(opts: Options) -> io::Result<()>
+daemon.rs::fn serve	2866..3628	async fn serve(board: Arc<Board>, mut stream: UnixStream)
+daemon.rs::struct Session	3630..3730	struct Session { id: u64, agent: String, rank: u64, seq: u64
+daemon.rs::struct Board	3732..4228	struct Board { repo: PathBuf, /// Idle read connections to s
+daemon.rs::impl Board	4230..4241,4241..4247,4745..4751,5999..6005,8182..8188,9322..9328,9645..9651,9951..9957,10770..10772	impl Board
+daemon.rs::impl Board::fn dispatch	4247..4745	async fn dispatch(&self, method: &str, params: Value) -> Res
+daemon.rs::impl Board::fn session_start	4751..5999	fn session_start(&self, p: proto::SessionStart) -> Result<pr
+daemon.rs::impl Board::fn post	6005..8182	async fn post(&self, p: proto::Post) -> Result<proto::Posted
+daemon.rs::impl Board::fn read_file	8188..9322	async fn read_file(&self, p: proto::ReadFile) -> Result<prot
+daemon.rs::impl Board::fn status	9328..9645	fn status(&self) -> proto::StatusInfo
+daemon.rs::impl Board::fn session	9651..9951	fn session(&self, token: &str) -> Result<Arc<tokio::sync::Mu
+daemon.rs::impl Board::fn with_reader	9957..10770	async fn with_reader<T: Send + 'static>( &self, f: impl FnOn
+daemon.rs::struct StubNote	10774..10928	struct StubNote<'a> { session: u64, rank: u64, seq: u64, fil
+daemon.rs::fn parse	10930..11100	fn parse<T: DeserializeOwned>(params: Value) -> Result<T, Rp
+daemon.rs::fn reply	11102..11253	fn reply<T: Serialize>(r: Result<T, RpcError>) -> Result<Val

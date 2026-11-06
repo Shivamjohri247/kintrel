@@ -1,0 +1,29 @@
+[package]
+name = "kintrel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kintrel-core.workspace = true
+kintrel-lang.workspace = true
+kintrel-ci.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+gix.workspace = true
+reflink-copy.workspace = true
+ignore.workspace = true
+globset.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

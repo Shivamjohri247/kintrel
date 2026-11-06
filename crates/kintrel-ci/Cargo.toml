@@ -1,0 +1,22 @@
+[package]
+name = "kintrel-ci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kintrel-core.workspace = true
+kintrel-lang.workspace = true
+globset.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
+
+# The Windows sandbox backend (AppContainer); keeps `unsafe` out of this workspace.
+[target.'cfg(windows)'.dependencies]
+rappct = "0.13"

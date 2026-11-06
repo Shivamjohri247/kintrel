@@ -1,0 +1,18 @@
+sample.ts	39..40,74..76,181..183,244..298,518..520,583..585,616..617,650..651,683..684,700..702,742..786	// Plain comment, separated by a blank line: glue.
+sample.ts::import "fs/promises"	0..39	import { readFile } from "fs/promises";
+sample.ts::export "./helper"	40..74	export { helper } from "./helper";
+sample.ts::function price	76..181	export function price(qty: number): number
+sample.ts::function price#1	183..244	export function price(qty: number, currency: string): number
+sample.ts::class Cart	298..355,355..359,385..390,463..467,516..518	@sealed export class Cart extends Base implements Priced
+sample.ts::class Cart::field items	359..385	private items: Item[] = []
+sample.ts::class Cart::method total	390..463	total(): number
+sample.ts::class Cart::method empty	467..516	static empty(): Cart
+sample.ts::interface Priced	520..544,544..548,561..565,580..583	export interface Priced
+sample.ts::interface Priced::field price	548..561	price: number
+sample.ts::interface Priced::method total	565..580	total(): number
+sample.ts::type Money	585..616	type Money = { cents: number };
+sample.ts::enum Currency	617..650	export enum Currency
+sample.ts::const TAX	651..683	export const TAX = 0.2, FEE = 1;
+sample.ts::const counter	684..700	let counter = 0;
+sample.ts::namespace Util	702..717,717..721,740..742	namespace Util
+sample.ts::namespace Util::const y	721..740	export const y = 2;

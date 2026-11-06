@@ -1,0 +1,8 @@
+sample.js	20..22,80..82,161..163,225..254,298..299	module.exports = { add };
+sample.js::import "fs"	0..20	import fs from "fs";
+sample.js::function add	22..80	function add(a, b)
+sample.js::class Store	82..101,101..105,114..119,159..161	export class Store
+sample.js::class Store::field count	105..114	count = 0
+sample.js::class Store::method get	119..159	get(key)
+sample.js::const handler	163..225	export const handler = async (req) =>
+sample.js::export extra	254..298	exports.extra = function ()

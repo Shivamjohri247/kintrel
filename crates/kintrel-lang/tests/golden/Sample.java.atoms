@@ -1,0 +1,14 @@
+Sample.java	0..15,37..38,71..73,484..486,541..543,569..571,597..598	package shop;
+Sample.java::import java.util.List	15..37	import java.util.List;
+Sample.java::import java.lang.Math.max	38..71	import static java.lang.Math.max;
+Sample.java::class Cart	73..137,137..143,174..180,245..251,347..353,434..440,482..484	public class Cart extends Base implements Priced
+Sample.java::class Cart::field lines	143..174	private final List<Line> lines;
+Sample.java::class Cart::constructor Cart	180..245	public Cart(List<Line> lines)
+Sample.java::class Cart::method total	251..347	@Override public int total()
+Sample.java::class Cart::method total#1	353..434	public int total(int discount)
+Sample.java::class Cart::class Line	440..482	static class Line
+Sample.java::interface Priced	486..503,503..509,522..527,539..541	interface Priced
+Sample.java::interface Priced::field ZERO	509..522	int ZERO = 0;
+Sample.java::interface Priced::method total	527..539	int total();
+Sample.java::enum Currency	543..557,557..569	enum Currency
+Sample.java::record Money	571..595,595..597	record Money(int cents)

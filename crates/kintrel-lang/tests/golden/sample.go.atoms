@@ -1,0 +1,10 @@
+sample.go	0..44,72..74,119..121,152..154,209..211,238..240,358..360,418..420,492..494,508..509	// Package cart prices carts.
+sample.go::import <anon>	44..72	import ( "fmt" "strings" )
+sample.go::const MaxItems	74..119	const MaxItems = 100
+sample.go::var registry	121..152	var registry = map[string]int{}
+sample.go::type Cart	154..209	type Cart struct { Lines []Line }
+sample.go::type Line	211..238	type Line struct{ Qty int }
+sample.go::method (c *Cart) Total	240..358	func (c *Cart) Total() int
+sample.go::method (l Line) String	360..418	func (l Line) String() string
+sample.go::method (c *Cart) String	420..492	func (c *Cart) String() string
+sample.go::func main	494..508	func main()

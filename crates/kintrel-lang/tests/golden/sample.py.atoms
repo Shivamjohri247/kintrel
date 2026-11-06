@@ -1,0 +1,13 @@
+sample.py	0..31,45..46,87..88,109..111,126..127,147..149,570..573,629..632,672..818	"""Module docstring: glue."""
+sample.py::import os	31..45	import os, sys
+sample.py::import collections	46..87	from collections import OrderedDict as OD
+sample.py::import .	88..109	from . import sibling
+sample.py::var MAX_ITEMS	111..126	MAX_ITEMS = 100
+sample.py::var TIMEOUT	127..147	TIMEOUT: float = 2.5
+sample.py::class Cart	149..209,209..267,283..289,342..348,527..533	@dataclass class Cart:
+sample.py::class Cart::var currency	267..283	currency = "USD"
+sample.py::class Cart::def __init__	289..342	def __init__(self, items):
+sample.py::class Cart::def price	348..527	@property def price(self):
+sample.py::class Cart::class Meta	533..570	class Meta:
+sample.py::def total	573..629	def total(carts):
+sample.py::def total#1	632..672	def total(carts, currency):

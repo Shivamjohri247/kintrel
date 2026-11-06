@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc af3900eef3013412194a59619c98aecbd74377f05aa7350cd5733f1983b39a7f # shrinks to agents = [[Body(0), Delete(5), Delete(0)], [Body(4), Delete(4)], [Body(4), Body(5)]], shuffle = [4, 2, 1, 0, 3, 5]
+cc 5d134ac6aafa1f53c1899648e62cd2abc29640adde86b383a93daa0cbb052d52 # shrinks to agents = [[Delete(2)], [Body(0)], [Body(0), Delete(0), Add]], shuffle = [0, 1, 2, 3, 4, 5]
