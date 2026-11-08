@@ -35,12 +35,13 @@ fn no_fail(file: &str) -> String {
     shell(
         &format!("! grep -q FAIL {file}"),
         // One `if`, nothing after it: in cmd, `if c (a) & b` makes `b` part of the `if`.
-        &format!("findstr /C:FAIL {file} >nul & if errorlevel 2 (exit /b 2) else if errorlevel 1 (exit /b 0) else (exit /b 1)"),
+        &format!("findstr /C:FAIL {file} & if errorlevel 2 (exit /b 2) else if errorlevel 1 (exit /b 0) else (exit /b 1)"),
     )
 }
 
 fn config() -> String {
-    CONFIG.replace("{NO_FAIL}", &no_fail("{file}")).replace("{SLEEP}", &shell("sleep 1", "ping -n 2 127.0.0.1 >nul & exit /b 0"))
+    // Windows has no sleep a sandboxed check can use (ping needs the network), so `slow` is quick there.
+    CONFIG.replace("{NO_FAIL}", &no_fail("{file}")).replace("{SLEEP}", &shell("sleep 1", "echo slow"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
