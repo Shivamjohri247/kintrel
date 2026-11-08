@@ -480,7 +480,16 @@ mod appcontainer {
     const CAPABILITY: &str = "kintrelChecks";
 
     pub fn start(cmd: &str, dir: Option<&Path>, policy: &Policy, env: &[(String, OsString)]) -> Result<Running, String> {
-        let e = |what: &str, err: &dyn std::fmt::Display| format!("AppContainer {what}: {err}");
+        // The whole chain: the OS error is a launch error's source.
+        let e = |what: &str, err: &dyn std::error::Error| {
+            let mut s = format!("AppContainer {what}: {err}");
+            let mut cause = err.source();
+            while let Some(c) = cause {
+                s.push_str(&format!(": {c}"));
+                cause = c.source();
+            }
+            s
+        };
         // One container per run, granted only its checkout, so a check reaches no other
         // checkout; deleted when the check ends. Not one per checkout: checks of one snapshot
         // share a checkout and run at once, and would create, then delete, each other's (seen

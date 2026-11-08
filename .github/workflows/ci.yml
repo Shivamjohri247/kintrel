@@ -13,6 +13,8 @@ jobs:
         os: [windows-latest, ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      RAPPCT_DEBUG_LAUNCH: "1"  # rappct prints the Win32 error of a failed AppContainer launch
     steps:
       - uses: actions/checkout@v4
       # The toolchain is pinned in rust-toolchain.toml; rustup installs it on first use.
