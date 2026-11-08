@@ -81,7 +81,11 @@ pub fn start(cmd: &str, dir: Option<&Path>, policy: Option<&Policy>, env: &[(Str
         Some(policy) => command(cmd, dir, policy)?,
         None => plain_shell(cmd),
     };
-    c.env_clear().envs(env.iter().map(|(k, v)| (k, v))).stdin(Stdio::null()).stdout(Stdio::piped());
+    // stdout and stderr share one pipe at the process level, so the sandbox's own errors (bwrap
+    // failing to set up, say) reach the output, not just the check's (`2>&1` in the shell).
+    let (output, writer) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
+    let stderr = writer.try_clone().map_err(|e| format!("pipe: {e}"))?;
+    c.env_clear().envs(env.iter().map(|(k, v)| (k, v))).stdin(Stdio::null()).stdout(writer).stderr(stderr);
     if let Some(dir) = dir {
         c.current_dir(dir);
     }
@@ -92,7 +96,8 @@ pub fn start(cmd: &str, dir: Option<&Path>, policy: Option<&Policy>, env: &[(Str
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0000_0200); // CREATE_NEW_PROCESS_GROUP
     let mut child = c.spawn().map_err(|e| format!("could not start: {e}"))?;
-    let output = Box::new(child.stdout.take().expect("piped"));
+    drop(c); // its copies of the pipe's write end, or the output never ends
+    let output = Box::new(output);
     let wait = move |timeout: Duration| {
         let start = Instant::now();
         loop {

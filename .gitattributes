@@ -1,0 +1,3 @@
+# Files are stored and checked out byte for byte: the golden tests compare exact bytes,
+# and Git on Windows would otherwise turn LF into CRLF.
+* -text

@@ -12,7 +12,7 @@ const CONFIG: &str = r#"
 [[check]]
 name = "no-fail-marker"
 scope = "file"
-run = "! grep -q FAIL {file}"
+run = "{NO_FAIL}"
 inputs = ["*.txt"]
 gate = true
 
@@ -20,17 +20,31 @@ gate = true
 name = "slow"
 tier = "test"
 scope = "repo"
-run = "sleep 1"
+run = "{SLEEP}"
 inputs = ["**"]
 gate = true
 "#;
+
+/// A check command in the platform shell: `sh`, or `cmd` on Windows.
+fn shell(unix: &str, windows: &str) -> String {
+    if cfg!(windows) { windows } else { unix }.to_owned()
+}
+
+/// Passes unless `file` contains FAIL.
+fn no_fail(file: &str) -> String {
+    shell(&format!("! grep -q FAIL {file}"), &format!("findstr /C:FAIL {file} >nul && exit /b 1 || exit /b 0"))
+}
+
+fn config() -> String {
+    CONFIG.replace("{NO_FAIL}", &no_fail("{file}")).replace("{SLEEP}", &shell("sleep 1", "ping -n 2 127.0.0.1 >nul & exit /b 0"))
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gate_blocks_and_feedback_is_fast() {
     let repo = std::env::temp_dir().join(format!("kt-ci-daemon-{}", std::process::id()));
     std::fs::remove_dir_all(&repo).ok();
     std::fs::create_dir_all(&repo).unwrap();
-    std::fs::write(repo.join("kintrel.toml"), CONFIG).unwrap();
+    std::fs::write(repo.join("kintrel.toml"), config()).unwrap();
     std::fs::write(repo.join("a.txt"), "ok\n").unwrap();
     kintrel_core::board::init(&repo).unwrap();
     let opts = Options { repo: repo.clone(), durability: Durability::Normal, promote_every: None };
@@ -87,7 +101,7 @@ async fn gate_blocks_and_feedback_is_fast() {
     // never used: nothing runs it, and promotion waits for a person to approve the file.
     let marker = std::env::temp_dir().join(format!("kt-ci-pwned-{}", std::process::id()));
     std::fs::remove_file(&marker).ok();
-    let evil = format!("[[check]]\nname = \"x\"\nscope = \"repo\"\nrun = \"touch {}\"\ninputs = [\"**\"]\n", marker.display());
+    let evil = format!("[[check]]\nname = \"x\"\nscope = \"repo\"\nrun = 'touch {}'\ninputs = [\"**\"]\n", marker.display());
     let files = vec![FileWrite { path: "kintrel.toml".into(), content: Some(evil.clone()), base: None }];
     let _: Posted = c.call(proto::POST, &Post { token: s.token.clone(), files, summary: None }).await.unwrap();
     let st: StatusInfo = c.call(proto::PROMOTE_NOW, &proto::PromoteNow::default()).await.unwrap();
@@ -101,7 +115,7 @@ async fn gate_blocks_and_feedback_is_fast() {
     // hash, or a missing or wrong token, is refused.
     let reviewed = kintrel_core::Hash::of(evil.as_bytes());
     let key = std::fs::read_to_string(kintrel_core::board::person_key(&repo).unwrap()).unwrap();
-    let token = |key: &str, h| Some(kintrel_core::board::approval(key, Some(kintrel_core::Hash::of(CONFIG.as_bytes())), h));
+    let token = |key: &str, h| Some(kintrel_core::board::approval(key, Some(kintrel_core::Hash::of(config().as_bytes())), h));
     let approve = |approve_config, approval| proto::PromoteNow { approve_config: Some(approve_config), approval };
     for wrong in [
         approve(kintrel_core::Hash::default(), token(&key, kintrel_core::Hash::default())),
@@ -146,7 +160,7 @@ async fn write(c: &mut Client, agent: &str, path: &str, text: &str) -> (String, 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bisection_rejects_only_the_culprit() {
-    let config = "[[check]]\nname = \"no-fail\"\nscope = \"file\"\nrun = \"! grep -q FAIL {file}\"\ninputs = [\"*.txt\"]\ngate = true\n";
+    let config = &format!("[[check]]\nname = \"no-fail\"\nscope = \"file\"\nrun = \"{}\"\ninputs = [\"*.txt\"]\ngate = true\n", no_fail("{file}"));
     let (repo, mut c) = board("bisect", config, &[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]).await;
     let (_, good1) = write(&mut c, "a", "a.txt", "a2\n").await;
     let (bad_token, bad) = write(&mut c, "b", "b.txt", "FAIL\n").await;
@@ -182,9 +196,10 @@ async fn deploys_and_the_backstop() {
     let log = logdir.join("log");
     // `full` is not a gate check, so it never blocks promotion by itself; the backstop runs it.
     let config = format!(
-        "[[check]]\nname = \"full\"\ntier = \"test\"\nscope = \"repo\"\nrun = \"! grep -q FAIL a.txt\"\ninputs = [\"*.txt\"]\n\n\
-         [[deploy]]\nname = \"ship\"\nrun = \"cat a.txt >> {}\"\nwritable = [\"{}\"]\n",
-        log.display(),
+        "[[check]]\nname = \"full\"\ntier = \"test\"\nscope = \"repo\"\nrun = \"{}\"\ninputs = [\"*.txt\"]\n\n\
+         [[deploy]]\nname = \"ship\"\nrun = '{}'\nwritable = ['{}']\n",
+        no_fail("a.txt"),
+        shell(&format!("cat a.txt >> {}", log.display()), &format!("type a.txt >> {}", log.display())),
         logdir.display()
     );
     let (repo, mut c) = board("backstop", &config, &[("a.txt", "v0\n")]).await;
