@@ -25,7 +25,7 @@ Each proposal costs one model call, and it reaches head only through the same ga
 ## Platforms
 
 - **macOS and Linux:** fully supported; the test suite passes on both. Checks run in `sandbox-exec` on macOS and in bubblewrap (`bwrap`) on Linux, so install bubblewrap there.
-- **Windows:** builds, but has not been run yet. The daemon talks over a named pipe, and checks run in `cmd` inside an AppContainer. Checks see no files in your profile unless their `kintrel.toml` entry lists them under `readable`, and no network unless `network = true`.
+- **Windows:** the test suite passes on GitHub Actions' Windows runners; `kintrel agent` is not available there yet. The daemon talks over a named pipe, and checks run in `cmd` inside an AppContainer. Checks see no files in your profile unless their `kintrel.toml` entry lists them under `readable`, and no network unless `network = true`. A sandboxed check cannot redirect to `nul` (the AppContainer cannot open it): redirect to a file in the checkout instead.
 
 ## Build
 
