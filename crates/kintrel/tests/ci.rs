@@ -71,7 +71,11 @@ async fn gate_blocks_and_feedback_is_fast() {
         if let Some(n) = n.notices.into_iter().find(|n| n.kind == "ci_failed") {
             break n;
         }
-        assert!(posted_at.elapsed() < Duration::from_secs(5), "no ci_failed notice");
+        if posted_at.elapsed() > Duration::from_secs(5) {
+            let run = proto::ChecksRun { token: Some(s.token.clone()), ..Default::default() };
+            let ran: proto::ChecksRan = c.call(proto::CHECKS_RUN, &run).await.unwrap();
+            panic!("no ci_failed notice; the checks say: {:#?}", ran.outcomes);
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let signal = posted_at.elapsed();
