@@ -81,6 +81,11 @@ async fn gate_blocks_and_feedback_is_fast() {
     // it is promoted. The author is told, refreshes (the note is reported lost) and redoes it.
     let st: StatusInfo = c.call(proto::PROMOTE_NOW, &proto::Status {}).await.unwrap();
     let st = if st.promoted == st.head { st } else { c.call(proto::PROMOTE_NOW, &proto::Status {}).await.unwrap() };
+    if !st.failing.is_empty() {
+        let run = proto::ChecksRun { token: Some(s.token.clone()), ..Default::default() };
+        let ran: proto::ChecksRan = c.call(proto::CHECKS_RUN, &run).await.unwrap();
+        panic!("{st:?}\nchecks: {:#?}", ran.outcomes);
+    }
     assert_eq!((st.promoted, st.failing.len()), (st.head, 0), "{st:?}");
     let read = |at| proto::ReadFile { token: String::new(), path: "a.txt".into(), at };
     let head: proto::FileContent = c.call(proto::READ_FILE, &read(st.head)).await.unwrap();

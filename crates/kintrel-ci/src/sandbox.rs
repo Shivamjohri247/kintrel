@@ -243,6 +243,16 @@ pub const SECRETS: &[&str] = &[
 #[cfg(target_os = "linux")]
 const SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"];
 
+/// The sockets that exist, resolved and once each: where `/var/run` links to `/run` (GitHub's
+/// runners), bubblewrap cannot mount over `/var/run/docker.sock` inside its read-only root.
+#[cfg(target_os = "linux")]
+fn sockets() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = SOCKETS.iter().filter_map(|s| std::fs::canonicalize(s).ok()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// `sh -c cmd` inside the sandbox, with `dir` (the checkout) writable. `Err` names what is
 /// missing on this system. (Windows starts differently: see `appcontainer`.)
 #[cfg_attr(windows, allow(dead_code))]
@@ -351,7 +361,7 @@ fn agent_backend(argv: &[OsString], p: &AgentPolicy, writable: &[PathBuf]) -> Re
             c.arg("--tmpfs").arg(&d);
         }
     }
-    for s in SOCKETS.iter().map(Path::new).filter(|s| s.exists()) {
+    for s in sockets() {
         c.arg("--ro-bind").arg("/dev/null").arg(s);
     }
     // ponytail: bubblewrap cannot filter connect() by path, so Linux hides the usual places
@@ -432,7 +442,7 @@ fn backend(cmd: &str, dir: Option<&Path>, policy: &Policy, writable: &[PathBuf],
     for p in writable.iter().filter(|p| p.exists() && !temps.contains(p)) {
         c.arg("--bind").arg(p).arg(p);
     }
-    for p in secrets.iter().chain(&SOCKETS.iter().map(PathBuf::from).collect::<Vec<_>>()) {
+    for p in secrets.iter().chain(&sockets()) {
         if p.is_dir() {
             c.arg("--tmpfs").arg(p);
         } else if p.exists() {
