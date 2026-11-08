@@ -481,14 +481,12 @@ mod appcontainer {
 
     pub fn start(cmd: &str, dir: Option<&Path>, policy: &Policy, env: &[(String, OsString)]) -> Result<Running, String> {
         let e = |what: &str, err: &dyn std::fmt::Display| format!("AppContainer {what}: {err}");
-        // One container per checkout (its directory name is unique per run), so a check reaches
-        // only its own checkout; deleted when the check ends.
+        // One container per run, granted only its checkout, so a check reaches no other
+        // checkout; deleted when the check ends. Not one per checkout: checks of one snapshot
+        // share a checkout and run at once, and would create, then delete, each other's (seen
+        // on the first Windows CI run).
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tag = dir.and_then(Path::file_name).map_or_else(
-            || format!("tools-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let name = format!("kintrel.check.{tag}");
+        let name = format!("kintrel.check.{}.{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let profile = AppContainerProfile::ensure(&name, "Kintrel check", Some("One Kintrel check run")).map_err(|x| e("profile", &x))?;
         if let Some(dir) = dir {
             grant(profile.sid.as_string(), dir, "M", false)?;
