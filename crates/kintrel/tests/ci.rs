@@ -30,9 +30,12 @@ fn shell(unix: &str, windows: &str) -> String {
     if cfg!(windows) { windows } else { unix }.to_owned()
 }
 
-/// Passes unless `file` contains FAIL.
+/// Passes unless `file` contains FAIL (or cannot be read: findstr exits 2 on errors).
 fn no_fail(file: &str) -> String {
-    shell(&format!("! grep -q FAIL {file}"), &format!("findstr /C:FAIL {file} >nul && exit /b 1 || exit /b 0"))
+    shell(
+        &format!("! grep -q FAIL {file}"),
+        &format!("findstr /C:FAIL {file} & if errorlevel 2 (exit /b 2) & if errorlevel 1 (exit /b 0) & exit /b 1"),
+    )
 }
 
 fn config() -> String {
