@@ -561,6 +561,11 @@ mod appcontainer {
         if (once && done.lock().unwrap().contains(&key)) || !dir.exists() {
             return Ok(());
         }
+        // One icacls at a time: each rewrites the whole ACL, so two checks granting their
+        // containers the same checkout at once could drop each other's entry (seen on Windows CI
+        // as "Access is denied").
+        static ACL: Mutex<()> = Mutex::new(());
+        let _one = ACL.lock().unwrap();
         let status = Command::new("icacls")
             .arg(dir)
             .args(["/grant", &format!("*{sid}:(OI)(CI){rights}"), "/T", "/C", "/Q"])
