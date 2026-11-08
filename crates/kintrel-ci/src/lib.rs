@@ -31,10 +31,23 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Variables every check sees (SPEC §10.2 env allowlist), on top of `check.env`.
 #[cfg(unix)]
 const BASE_ENV: &[&str] = &["PATH", "HOME"];
-/// Windows processes need a few more to work at all.
+/// Windows processes need a few more to work at all; without `windir`, an AppContainer launch
+/// fails with error 203 (seen on the first Windows CI run).
 #[cfg(windows)]
-const BASE_ENV: &[&str] =
-    &["PATH", "PATHEXT", "SystemRoot", "SystemDrive", "COMSPEC", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"];
+const BASE_ENV: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "COMSPEC",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

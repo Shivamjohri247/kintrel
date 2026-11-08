@@ -517,7 +517,9 @@ mod appcontainer {
             .map_err(|x| e("capabilities", &x))?;
         let comspec = std::env::var_os("COMSPEC").map_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"), PathBuf::from);
         // Exactly the allowlist (which has the Windows essentials): never merge the parent's.
-        let env = env.iter().map(|(k, v)| (OsString::from(k), v.clone())).collect();
+        // Sorted by name, ignoring case, as Windows expects an environment block to be.
+        let mut env: Vec<(OsString, OsString)> = env.iter().map(|(k, v)| (OsString::from(k), v.clone())).collect();
+        env.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
         let opts = LaunchOptions {
             exe: comspec,
             cmdline: Some(format!(" /D /S /C \"{cmd}\"")),
