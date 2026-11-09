@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 pub type ClientStream = tokio::net::UnixStream;
 #[cfg(windows)]
-pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+pub type ClientStream = interprocess::os::windows::named_pipe::tokio::DuplexPipeStream<interprocess::os::windows::named_pipe::pipe_mode::Bytes>;
 
 #[cfg(unix)]
 pub type ServerStream = tokio::net::UnixStream;
@@ -64,7 +64,7 @@ pub async fn connect(endpoint: &Path) -> io::Result<ClientStream> {
         }
         let mut tries = 0;
         let mut pipe = loop {
-            match tokio::net::windows::named_pipe::ClientOptions::new().open(name) {
+            match open_pipe(name) {
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 40 => {
                     tries += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -84,6 +84,28 @@ pub async fn connect(endpoint: &Path) -> io::Result<ClientStream> {
         }
         Ok(pipe)
     }
+}
+
+/// The access a client opens the pipe with, and all the pipe grants agents: read, write data and
+/// write attributes. Not `GENERIC_WRITE`, whose FILE_APPEND_DATA is, on a pipe, the right to
+/// create a server instance of it, with which a client could intercept others.
+#[cfg(windows)]
+const CLIENT_ACCESS: u32 = 0x0012_018B; // FILE_GENERIC_READ | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES
+
+/// Opens the pipe with exactly [`CLIENT_ACCESS`], for overlapped I/O, and at the identification
+/// level only (the server cannot act as the client), as a tokio stream.
+#[cfg(windows)]
+fn open_pipe(name: &str) -> io::Result<ClientStream> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(CLIENT_ACCESS)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
+        .security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+        .open(name)?;
+    ClientStream::try_from(std::os::windows::io::OwnedHandle::from(file)).map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// Answers a new client's challenge (Windows; nothing to do on Unix, where the socket's
@@ -142,7 +164,7 @@ impl Listener {
                 return Err(io::Error::new(io::ErrorKind::AddrInUse, "a daemon is already running for this board"));
             }
             let name = PathBuf::from(format!(r"\\.\pipe\kintrel-{}", random_hex()));
-            let inner = Self::listener(&name)?;
+            let inner = Self::listener(&name, runtime)?;
             let key = format!("{}{}", random_hex(), random_hex());
             // Publish the key, then the name, once the pipe exists; write-then-rename so readers
             // never see half of either.
@@ -156,12 +178,13 @@ impl Listener {
     }
 
     /// The pipe: created exclusively (the first instance), local clients only, and open to its
-    /// owner, SYSTEM and administrators, plus agents run through `kintrel agent`, whose
-    /// AppContainer carries the agents' capability. (No Low integrity label: that would also
+    /// owner, SYSTEM and administrators, plus this board's agents run through `kintrel agent`,
+    /// whose AppContainer carries the board's agents capability, with [`CLIENT_ACCESS`] only. (No Low integrity label: that would also
     /// admit any Low-integrity process of the same user, such as a browser's sandbox.)
     #[cfg(windows)]
     fn listener(
         name: &Path,
+        runtime: &Path,
     ) -> io::Result<
         interprocess::os::windows::named_pipe::tokio::PipeListener<
             interprocess::os::windows::named_pipe::pipe_mode::Bytes,
@@ -169,8 +192,8 @@ impl Listener {
         >,
     > {
         use interprocess::os::windows::named_pipe::{PipeListenerOptions, pipe_mode};
-        let agents = kintrel_ci::sandbox::agent_capability_sid().map_err(io::Error::other)?;
-        let sddl = format!("D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{agents})");
+        let agents = kintrel_ci::sandbox::agent_capability_sid(runtime).map_err(io::Error::other)?;
+        let sddl = format!("D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x{CLIENT_ACCESS:X};;;{agents})");
         let sddl = widestring::U16CString::from_str(&sddl).map_err(io::Error::other)?;
         let sd = interprocess::os::windows::security_descriptor::SecurityDescriptor::deserialize(&sddl)?;
         PipeListenerOptions::new().path(name.as_os_str()).security_descriptor(Some(sd)).create_tokio_duplex::<pipe_mode::Bytes>()

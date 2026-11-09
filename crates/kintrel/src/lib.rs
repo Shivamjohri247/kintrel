@@ -25,7 +25,9 @@ pub async fn connect(repo: &Path) -> anyhow::Result<Client> {
     if !kintrel_core::board::state_db(repo).exists() {
         bail!("{} is not a kintrel board (run `kintrel init`)", repo.display());
     }
-    let log = std::fs::File::create(kintrel_core::board::data_dir(repo).join("daemon.log"))?;
+    // A sandboxed agent cannot write the board, so it cannot start a daemon either.
+    let log = std::fs::File::create(kintrel_core::board::data_dir(repo).join("daemon.log"))
+        .context("no daemon is running for this board, and this process cannot start one (a sandboxed agent cannot): run any kintrel command outside the sandbox first")?;
     let mut daemon = std::process::Command::new(std::env::current_exe()?);
     daemon
         .arg("--repo")

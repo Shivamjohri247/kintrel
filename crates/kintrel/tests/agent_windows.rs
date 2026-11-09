@@ -39,7 +39,7 @@ async fn agents_work_in_their_view_but_cannot_act_as_the_person() {
     let data = board::data_dir(&repo);
     let p = |p: &std::path::Path| p.display().to_string();
     let script = format!(
-        "echo ok> {v}\\ok.txt & type {k} > {v}\\key.txt 2>&1 & echo x> {b}\\x.txt & {kin} --repo {r} status > {v}\\status.txt 2>&1",
+        "echo ok> {v}\\ok.txt & type {k} > {v}\\key.txt 2>&1 & echo x> {b}\\x.txt & {kin} --version > {v}\\version.txt 2>&1 & {kin} --repo {r} status > {v}\\status.txt 2>&1",
         v = p(&view),
         k = p(&key),
         b = p(&data),
@@ -59,7 +59,13 @@ async fn agents_work_in_their_view_but_cannot_act_as_the_person() {
     let secret = std::fs::read_to_string(&key).unwrap();
     assert!(!read("key.txt").contains(secret.trim()), "the person key leaked");
     assert!(!data.join("x.txt").exists(), "the agent wrote the board");
-    assert!(read("status.txt").contains("promoted"), "the daemon is reachable: {:?}", read("status.txt"));
+    let acl = std::process::Command::new("icacls").arg(&kintrel).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    assert!(
+        read("status.txt").contains("promoted"),
+        "the daemon is reachable: {:?}\nversion: {:?}\nkintrel.exe ACL: {acl}",
+        read("status.txt"),
+        read("version.txt")
+    );
 
     std::fs::remove_dir_all(&runtime).ok();
     std::fs::remove_dir_all(&repo).ok();

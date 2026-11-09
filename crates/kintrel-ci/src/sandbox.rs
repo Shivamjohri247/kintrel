@@ -288,14 +288,19 @@ pub struct AgentPolicy<'a> {
     pub socket: &'a Path,
 }
 
-/// The capability every agent's AppContainer carries (Windows): the daemon's pipe admits it,
-/// and the directories all agents read are granted to it.
-pub const AGENTS_CAPABILITY: &str = "kintrelAgents";
+/// The capability a board's agents carry in their AppContainers (Windows): that board's daemon
+/// pipe admits it, and what the board's agents read is granted to it. One per board (named by
+/// its runtime directory), so an agent reaches no other board's daemon or files.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn agents_capability(runtime: &Path) -> String {
+    format!("kintrelAgents.{}", runtime.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())
+}
 
-/// The SID of [`AGENTS_CAPABILITY`], for an ACL (Windows).
+/// The SID of the board's agents capability (see `agents_capability`), for an ACL (Windows).
 #[cfg(windows)]
-pub fn agent_capability_sid() -> Result<String, String> {
-    let sids = rappct::capability::derive_named_capability_sids(&[AGENTS_CAPABILITY]).map_err(|e| format!("agents capability: {e}"))?;
+pub fn agent_capability_sid(runtime: &Path) -> Result<String, String> {
+    let name = agents_capability(runtime);
+    let sids = rappct::capability::derive_named_capability_sids(&[name.as_str()]).map_err(|e| format!("agents capability: {e}"))?;
     Ok(sids.first().ok_or("agents capability: no SID")?.sid_sddl.clone())
 }
 
@@ -595,9 +600,12 @@ mod appcontainer {
         for w in writable {
             grant(profile.sid.as_string(), w, "M", false)?;
         }
-        let agents = super::agent_capability_sid()?;
-        // System directories are readable to every AppContainer already, and only
-        // administrators may change their ACLs.
+        let capability = super::agents_capability(p.socket);
+        let agents = super::agent_capability_sid(p.socket)?;
+        // Reads: the repository (the board in it, and the path the CLI opens), the daemon pipe's
+        // name and key (not the rest of the runtime directory: other agents' views and tokens),
+        // and the directories of the agent's program and of Kintrel. System directories are
+        // readable to every AppContainer already, and only administrators may change them.
         let system: Vec<String> =
             ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(|v| std::env::var(v).ok()).map(|v| v.to_lowercase()).collect();
         let readable_already = |d: &Path| {
@@ -606,16 +614,22 @@ mod appcontainer {
             system.iter().any(|s| d.starts_with(s.as_str()))
         };
         let programs = [exe.parent().map(Path::to_owned), std::env::current_exe().ok().and_then(|k| k.parent().map(Path::to_owned))];
-        // The repository (the board in it, and the path the CLI opens), as agents read on every OS.
-        let repo = p.board.parent().map(Path::to_owned);
-        for r in [repo, Some(p.socket.to_owned())].into_iter().chain(programs).flatten() {
-            if !readable_already(&r) {
-                grant(&agents, &r, "RX", false)?;
-            }
+        let reads: Vec<PathBuf> = [p.board.parent().map(Path::to_owned), Some(p.socket.join("pipe")), Some(p.socket.join("key"))]
+            .into_iter()
+            .chain(programs)
+            .flatten()
+            .filter(|r| !readable_already(r))
+            .collect();
+        // None may be, hold or lie in a person key or a secret path: refused, not granted.
+        let reads = super::refuse_secrets(&Policy { readable: reads, protected: vec![p.keys.to_owned()], ..Policy::default() }, None)?.readable;
+        for r in &reads {
+            grant(&agents, r, "RX", false)?;
         }
+        // And explicitly: whatever else changes, this board's agents never read a person key.
+        deny(&agents, p.keys)?;
         let sec = SecurityCapabilitiesBuilder::new(&profile.sid)
             .with_known(&[KnownCapability::InternetClient])
-            .with_named(&[super::AGENTS_CAPABILITY])
+            .with_named(&[capability.as_str()])
             .build()
             .map_err(|x| e("capabilities", &x))?;
         // The person's environment (the agent's PATH, its API key), `env` on top, sorted by name.
@@ -701,6 +715,19 @@ mod appcontainer {
         Ok(Running { output, wait: Box::new(wait) })
     }
 
+    /// Adds an inheritable deny-everything ACE for `sid` to `dir` with `icacls`.
+    fn deny(sid: &str, dir: &Path) -> Result<(), String> {
+        let status = Command::new("icacls")
+            .arg(dir)
+            .args(["/deny", &format!("*{sid}:(OI)(CI)F"), "/C", "/Q"])
+            .status()
+            .map_err(|e| format!("icacls: {e}"))?;
+        if !status.success() {
+            return Err(format!("icacls could not deny {} to {sid}", dir.display()));
+        }
+        Ok(())
+    }
+
     /// Adds an inheritable ACE for `sid` to `dir` with `icacls`, propagated to what is already
     /// inside. With `once`, only the first time per daemon (stable SIDs).
     // ponytail: a checkout is granted after it is populated, so icacls walks it; granting the
@@ -713,13 +740,16 @@ mod appcontainer {
             return Ok(());
         }
         // One icacls at a time: each rewrites the whole ACL, so two checks granting their
-        // containers the same checkout at once could drop each other's entry (seen on Windows CI
-        // as "Access is denied").
+        // containers the same checkout at once could drop each other's entry.
         static ACL: Mutex<()> = Mutex::new(());
         let _one = ACL.lock().unwrap();
+        // A directory's entry is inherited and applied to what it holds; a file's is its own.
+        let (inherit, walk): (&str, &[&str]) = if dir.is_dir() { ("(OI)(CI)", &["/T"]) } else { ("", &[]) };
         let status = Command::new("icacls")
             .arg(dir)
-            .args(["/grant", &format!("*{sid}:(OI)(CI){rights}"), "/T", "/C", "/Q"])
+            .args(["/grant", &format!("*{sid}:{inherit}{rights}")])
+            .args(walk)
+            .args(["/C", "/Q"])
             .status()
             .map_err(|e| format!("icacls: {e}"))?;
         if !status.success() {
