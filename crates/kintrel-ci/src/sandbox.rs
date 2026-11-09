@@ -639,17 +639,34 @@ mod appcontainer {
             vars.insert(k.to_string_lossy().to_uppercase(), (k.clone(), v.clone()));
         }
         let cmdline = argv.iter().skip(1).fold(super::quote_arg(exe.as_os_str()), |line, a| format!("{line} {}", super::quote_arg(a)));
+        // At a terminal the agent shares the console. Otherwise (a script, `claude -p`, CI) it
+        // gets pipes copied to and from ours: an inherited launch passes no handles, which left
+        // it without stdio, unable even to start programs of its own.
+        use std::io::IsTerminal;
+        let console = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let opts = LaunchOptions {
             exe,
             cmdline: Some(cmdline),
             cwd: Some(cwd.to_owned()),
             env: Some(vars.into_values().collect()),
-            stdio: StdioConfig::Inherit,
+            stdio: if console { StdioConfig::Inherit } else { StdioConfig::Pipe },
             join_job: Some(JobLimits { kill_on_job_close: true, ..Default::default() }),
             ..Default::default()
         };
-        let io = launch_in_container_with_io(&sec, &opts).map_err(|x| e("launch", &x))?;
+        let mut io = launch_in_container_with_io(&sec, &opts).map_err(|x| e("launch", &x))?;
+        let copy = |from: Option<std::fs::File>, to: fn() -> Box<dyn std::io::Write + Send>| {
+            from.map(|mut f| std::thread::spawn(move || std::io::copy(&mut f, &mut to()).ok()))
+        };
+        let out = copy(io.stdout.take(), || Box::new(std::io::stdout()));
+        let err = copy(io.stderr.take(), || Box::new(std::io::stderr()));
+        // Not joined: it ends with our stdin, or with the process.
+        if let Some(mut stdin) = io.stdin.take() {
+            std::thread::spawn(move || std::io::copy(&mut std::io::stdin(), &mut stdin).ok());
+        }
         let code = io.wait(None).map_err(|x| e("wait", &x))?;
+        for t in [out, err].into_iter().flatten() {
+            t.join().ok();
+        }
         Ok(code as i32)
     }
 
