@@ -7,7 +7,8 @@
 //! The daemon also writes a random key to `<runtime>/key`, which other users cannot read, and
 //! answers each new client's random challenge with a keyed BLAKE3 hash; a client sends nothing
 //! until the answer checks out. The daemon creates the first pipe instance exclusively and
-//! refuses remote clients. On Windows the endpoint passed around is the runtime directory.
+//! refuses remote clients; its ACL also admits agents sandboxed by `kintrel agent` (see
+//! `Listener::listener`). On Windows the endpoint passed around is the runtime directory.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
 #[cfg(unix)]
 pub type ServerStream = tokio::net::UnixStream;
 #[cfg(windows)]
-pub type ServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
+pub type ServerStream = interprocess::os::windows::named_pipe::tokio::DuplexPipeStream<interprocess::os::windows::named_pipe::pipe_mode::Bytes>;
 
 /// The endpoint for the board whose runtime directory is `runtime`: the socket on Unix, the
 /// runtime directory itself on Windows (it holds the pipe's name and key).
@@ -110,9 +111,10 @@ pub struct Listener {
     #[cfg(unix)]
     inner: tokio::net::UnixListener,
     #[cfg(windows)]
-    name: PathBuf,
-    #[cfg(windows)]
-    next: tokio::net::windows::named_pipe::NamedPipeServer,
+    inner: interprocess::os::windows::named_pipe::tokio::PipeListener<
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+    >,
 }
 
 impl Listener {
@@ -140,7 +142,7 @@ impl Listener {
                 return Err(io::Error::new(io::ErrorKind::AddrInUse, "a daemon is already running for this board"));
             }
             let name = PathBuf::from(format!(r"\\.\pipe\kintrel-{}", random_hex()));
-            let next = Self::instance(&name, true)?;
+            let inner = Self::listener(&name)?;
             let key = format!("{}{}", random_hex(), random_hex());
             // Publish the key, then the name, once the pipe exists; write-then-rename so readers
             // never see half of either.
@@ -149,13 +151,29 @@ impl Listener {
                 std::fs::write(&tmp, value.as_bytes())?;
                 std::fs::rename(&tmp, runtime.join(file))?;
             }
-            Ok(Listener { key, name, next })
+            Ok(Listener { key, inner })
         }
     }
 
+    /// The pipe: created exclusively (the first instance), local clients only, and open to its
+    /// owner, SYSTEM and administrators, plus agents run through `kintrel agent`, whose
+    /// AppContainer carries the agents' capability. (No Low integrity label: that would also
+    /// admit any Low-integrity process of the same user, such as a browser's sandbox.)
     #[cfg(windows)]
-    fn instance(name: &Path, first: bool) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-        tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(first).reject_remote_clients(true).create(name)
+    fn listener(
+        name: &Path,
+    ) -> io::Result<
+        interprocess::os::windows::named_pipe::tokio::PipeListener<
+            interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+            interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+        >,
+    > {
+        use interprocess::os::windows::named_pipe::{PipeListenerOptions, pipe_mode};
+        let agents = kintrel_ci::sandbox::agent_capability_sid().map_err(io::Error::other)?;
+        let sddl = format!("D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{agents})");
+        let sddl = widestring::U16CString::from_str(&sddl).map_err(io::Error::other)?;
+        let sd = interprocess::os::windows::security_descriptor::SecurityDescriptor::deserialize(&sddl)?;
+        PipeListenerOptions::new().path(name.as_os_str()).security_descriptor(Some(sd)).create_tokio_duplex::<pipe_mode::Bytes>()
     }
 
     pub async fn accept(&mut self) -> io::Result<ServerStream> {
@@ -165,9 +183,7 @@ impl Listener {
         }
         #[cfg(windows)]
         {
-            self.next.connect().await?;
-            let fresh = Self::instance(&self.name, false)?;
-            Ok(std::mem::replace(&mut self.next, fresh))
+            self.inner.accept().await
         }
     }
 }

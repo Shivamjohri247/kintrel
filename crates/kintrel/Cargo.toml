@@ -25,5 +25,11 @@ tokio.workspace = true
 [lints]
 workspace = true
 
+# The daemon's named pipe with a security descriptor (sandboxed agents may connect), without
+# `unsafe` in this workspace.
+[target.'cfg(windows)'.dependencies]
+interprocess = { version = "2.4", features = ["tokio"] }
+widestring = "1"
+
 [dev-dependencies]
 rusqlite.workspace = true

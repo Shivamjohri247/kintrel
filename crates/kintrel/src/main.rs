@@ -237,20 +237,27 @@ async fn main() -> anyhow::Result<()> {
                     std::fs::copy(settings, config.join("settings.json"))?;
                 }
             }
+            // A private temp directory (Windows: the AppContainer cannot use the person's).
+            let tmp = config.join("tmp");
+            std::fs::create_dir_all(&tmp)?;
+            let ours = [config.clone(), tmp.clone()];
             let policy = kintrel_ci::sandbox::AgentPolicy {
                 view: &view,
-                ours: std::slice::from_ref(&config),
+                ours: &ours,
                 extra: &writable,
                 board: &kintrel_core::board::data_dir(&repo),
                 keys: &kintrel_core::board::keys_dir()?,
                 socket: &daemon::socket_path(&repo)?,
             };
-            let mut agent = kintrel_ci::sandbox::agent(&command, &policy).map_err(anyhow::Error::msg)?;
+            let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![];
             if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
-                agent.env("CLAUDE_CONFIG_DIR", &config);
+                env.push(("CLAUDE_CONFIG_DIR".into(), config.clone().into()));
             }
-            let status = agent.current_dir(std::env::current_dir()?).status().context("could not start the agent")?;
-            std::process::exit(status.code().unwrap_or(1));
+            if cfg!(windows) {
+                env.extend(["TEMP", "TMP"].map(|k| (k.into(), tmp.clone().into())));
+            }
+            let code = kintrel_ci::sandbox::run_agent(&command, &policy, &env, &std::env::current_dir()?).map_err(anyhow::Error::msg)?;
+            std::process::exit(code);
         }
         Cmd::Promote { approve_config } => {
             let (approve_config, approval) = match approve_config {

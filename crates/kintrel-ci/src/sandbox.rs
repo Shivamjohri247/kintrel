@@ -28,7 +28,7 @@
 //! A backend that is missing is an error, never a silent unsandboxed run: a check that needs
 //! no sandbox says `sandbox = false` in `kintrel.toml`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -284,7 +284,102 @@ pub struct AgentPolicy<'a> {
     /// Every board's person key: unreadable.
     pub keys: &'a Path,
     /// The daemon's socket: the one Unix socket the agent may connect to (besides DNS on macOS).
+    /// On Windows, the runtime directory, which holds the daemon pipe's name and key.
     pub socket: &'a Path,
+}
+
+/// The capability every agent's AppContainer carries (Windows): the daemon's pipe admits it,
+/// and the directories all agents read are granted to it.
+pub const AGENTS_CAPABILITY: &str = "kintrelAgents";
+
+/// The SID of [`AGENTS_CAPABILITY`], for an ACL (Windows).
+#[cfg(windows)]
+pub fn agent_capability_sid() -> Result<String, String> {
+    let sids = rappct::capability::derive_named_capability_sids(&[AGENTS_CAPABILITY]).map_err(|e| format!("agents capability: {e}"))?;
+    Ok(sids.first().ok_or("agents capability: no SID")?.sid_sddl.clone())
+}
+
+/// Runs an agent (see [`agent`]) to the end, with `env` on top of the person's environment, at
+/// `cwd` (in its view); returns its exit code. On Windows it runs in an AppContainer.
+pub fn run_agent(argv: &[OsString], p: &AgentPolicy, env: &[(OsString, OsString)], cwd: &Path) -> Result<i32, String> {
+    #[cfg(windows)]
+    {
+        let writable = agent_writable(argv, p)?;
+        appcontainer::agent(argv, p, &writable, env, cwd)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = agent(argv, p)?;
+        c.envs(env.iter().map(|(k, v)| (k, v))).current_dir(cwd);
+        let status = c.status().map_err(|e| format!("could not start the agent: {e}"))?;
+        Ok(status.code().unwrap_or(1))
+    }
+}
+
+/// The checks every agent launch makes, and the directories it may write, resolved.
+fn agent_writable(argv: &[OsString], p: &AgentPolicy) -> Result<Vec<PathBuf>, String> {
+    let program = argv.first().ok_or("no agent command given")?;
+    if program.to_string_lossy().starts_with('-') {
+        return Err("the agent command cannot start with `-`".into());
+    }
+    let protected = vec![p.board.to_owned(), p.keys.to_owned()];
+    let extra = refuse_secrets(&Policy { writable: p.extra.to_vec(), protected, ..Policy::default() }, Some(p.view))?.writable;
+    Ok(std::iter::once(p.view.to_owned()).chain(p.ours.iter().cloned()).map(|p| canon(&p)).chain(extra).collect())
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned())
+}
+
+/// One argument for a Windows command line, quoted by the rules programs split it with (the
+/// MSVC runtime's: backslashes are literal except before a quote).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_arg(arg: &OsStr) -> String {
+    let s = arg.to_string_lossy();
+    if !s.is_empty() && !s.contains([' ', '\t', '"']) {
+        return s.into_owned();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            c => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// The program an agent command names (Windows): a path, or a name found on `PATH` as is or
+/// with `.exe` or `.com`. A `.cmd` or `.bat` script would need cmd.exe and its own quoting
+/// rules, so it is refused.
+#[cfg(windows)]
+fn resolve_exe(program: &OsStr) -> Result<PathBuf, String> {
+    let given = Path::new(program);
+    let found = if given.components().count() > 1 {
+        given.is_file().then(|| given.to_owned())
+    } else {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).find_map(|d| {
+            ["", ".exe", ".com"].iter().map(|ext| d.join(format!("{}{ext}", given.display()))).find(|c| c.is_file())
+        })
+    };
+    let found = found.ok_or_else(|| format!("{}: not found", given.display()))?;
+    match found.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
+        Some("cmd" | "bat") => Err(format!("{}: a .cmd or .bat script cannot run in the agent sandbox; run the program's .exe", found.display())),
+        _ => Ok(found),
+    }
 }
 
 /// An agent's command (`argv`), unable to act as the person (SPEC §13, local form). It writes
@@ -293,16 +388,10 @@ pub struct AgentPolicy<'a> {
 /// (a tmux server, Docker, the user's D-Bus and systemd), LaunchServices and Apple events on
 /// macOS, the person's terminal (`TIOCSTI`). Reads, the network and the keychain stay open:
 /// an agent needs its tools and its model.
-// ponytail: macOS and Linux; Windows needs an AppContainer with the profile granted.
+// (Windows: `run_agent` launches an AppContainer, see `appcontainer::agent`.)
+#[cfg(not(windows))]
 pub fn agent(argv: &[OsString], p: &AgentPolicy) -> Result<Command, String> {
-    let program = argv.first().ok_or("no agent command given")?;
-    if program.to_string_lossy().starts_with('-') {
-        return Err("the agent command cannot start with `-`".into());
-    }
-    let protected = vec![p.board.to_owned(), p.keys.to_owned()];
-    let extra = refuse_secrets(&Policy { writable: p.extra.to_vec(), protected, ..Policy::default() }, Some(p.view))?.writable;
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let writable: Vec<PathBuf> = std::iter::once(p.view.to_owned()).chain(p.ours.iter().cloned()).map(|p| canon(&p)).chain(extra).collect();
+    let writable = agent_writable(argv, p)?;
     let resolved = AgentPolicy { view: &canon(p.view), board: &canon(p.board), keys: &canon(p.keys), socket: &canon(p.socket), ..*p };
     let mut c = agent_backend(argv, &resolved, &writable)?;
     c.current_dir(p.view);
@@ -373,7 +462,7 @@ fn agent_backend(argv: &[OsString], p: &AgentPolicy, writable: &[PathBuf]) -> Re
     Ok(c)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn agent_backend(_argv: &[OsString], _p: &AgentPolicy, _writable: &[PathBuf]) -> Result<Command, String> {
     Err("sandboxed agents are not available on this OS yet".into())
 }
@@ -466,7 +555,7 @@ fn backend(_cmd: &str, _dir: Option<&Path>, _policy: &Policy, _writable: &[PathB
 // ponytail: compile-checked from macOS, not yet run on Windows (no Windows machine here).
 #[cfg(windows)]
 mod appcontainer {
-    use super::{Policy, Running};
+    use super::{AgentPolicy, Policy, Running};
     use rappct::launch::{JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io};
     use rappct::{AppContainerProfile, KnownCapability, SecurityCapabilitiesBuilder};
     use std::collections::HashSet;
@@ -479,17 +568,79 @@ mod appcontainer {
     /// Every check's container carries this capability; shared directories are granted to it.
     const CAPABILITY: &str = "kintrelChecks";
 
-    pub fn start(cmd: &str, dir: Option<&Path>, policy: &Policy, env: &[(String, OsString)]) -> Result<Running, String> {
-        // The whole chain: the OS error is a launch error's source.
-        let e = |what: &str, err: &dyn std::error::Error| {
-            let mut s = format!("AppContainer {what}: {err}");
-            let mut cause = err.source();
-            while let Some(c) = cause {
-                s.push_str(&format!(": {c}"));
-                cause = c.source();
-            }
-            s
+    /// An AppContainer failure with its whole chain: the OS error is a launch error's source.
+    fn failed(what: &str, err: &dyn std::error::Error) -> String {
+        let mut s = format!("AppContainer {what}: {err}");
+        let mut cause = err.source();
+        while let Some(c) = cause {
+            s.push_str(&format!(": {c}"));
+            cause = c.source();
+        }
+        s
+    }
+
+    /// An agent in an AppContainer of its own, one per view and kept across runs (so its grant
+    /// on the view stays valid), with the console. It writes `writable` (its view, its Claude
+    /// Code config and temp, `--writable` entries). Through the agents' capability it reads the
+    /// repository (the board in it), the runtime directory (the daemon pipe's name and key) and
+    /// the directories of its program and of Kintrel; the rest of the user profile, the person keys included, is
+    /// unreadable to it, as to every AppContainer. Network: the internet. Returns its exit code.
+    pub fn agent(argv: &[OsString], p: &AgentPolicy, writable: &[PathBuf], env: &[(OsString, OsString)], cwd: &Path) -> Result<i32, String> {
+        let e = failed;
+        let exe = super::resolve_exe(&argv[0])?;
+        let tag = |q: Option<&Path>| q.and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // Views live at <runtime>/views/<session>, and the runtime directory is the board's id.
+        let name = format!("kintrel.agent.{}.{}", tag(p.view.parent().and_then(Path::parent)), tag(Some(p.view)));
+        let profile = AppContainerProfile::ensure(&name, "Kintrel agent", Some("A Kintrel agent's sandbox")).map_err(|x| e("profile", &x))?;
+        for w in writable {
+            grant(profile.sid.as_string(), w, "M", false)?;
+        }
+        let agents = super::agent_capability_sid()?;
+        // System directories are readable to every AppContainer already, and only
+        // administrators may change their ACLs.
+        let system: Vec<String> =
+            ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(|v| std::env::var(v).ok()).map(|v| v.to_lowercase()).collect();
+        let readable_already = |d: &Path| {
+            let d = d.to_string_lossy().to_lowercase();
+            let d = d.trim_start_matches(r"\\?\");
+            system.iter().any(|s| d.starts_with(s.as_str()))
         };
+        let programs = [exe.parent().map(Path::to_owned), std::env::current_exe().ok().and_then(|k| k.parent().map(Path::to_owned))];
+        // The repository (the board in it, and the path the CLI opens), as agents read on every OS.
+        let repo = p.board.parent().map(Path::to_owned);
+        for r in [repo, Some(p.socket.to_owned())].into_iter().chain(programs).flatten() {
+            if !readable_already(&r) {
+                grant(&agents, &r, "RX", false)?;
+            }
+        }
+        let sec = SecurityCapabilitiesBuilder::new(&profile.sid)
+            .with_known(&[KnownCapability::InternetClient])
+            .with_named(&[super::AGENTS_CAPABILITY])
+            .build()
+            .map_err(|x| e("capabilities", &x))?;
+        // The person's environment (the agent's PATH, its API key), `env` on top, sorted by name.
+        let mut vars: std::collections::BTreeMap<String, (OsString, OsString)> =
+            std::env::vars_os().map(|(k, v)| (k.to_string_lossy().to_uppercase(), (k, v))).collect();
+        for (k, v) in env {
+            vars.insert(k.to_string_lossy().to_uppercase(), (k.clone(), v.clone()));
+        }
+        let cmdline = argv.iter().skip(1).fold(super::quote_arg(exe.as_os_str()), |line, a| format!("{line} {}", super::quote_arg(a)));
+        let opts = LaunchOptions {
+            exe,
+            cmdline: Some(cmdline),
+            cwd: Some(cwd.to_owned()),
+            env: Some(vars.into_values().collect()),
+            stdio: StdioConfig::Inherit,
+            join_job: Some(JobLimits { kill_on_job_close: true, ..Default::default() }),
+            ..Default::default()
+        };
+        let io = launch_in_container_with_io(&sec, &opts).map_err(|x| e("launch", &x))?;
+        let code = io.wait(None).map_err(|x| e("wait", &x))?;
+        Ok(code as i32)
+    }
+
+    pub fn start(cmd: &str, dir: Option<&Path>, policy: &Policy, env: &[(String, OsString)]) -> Result<Running, String> {
+        let e = failed;
         // One container per run, granted only its checkout, so a check reaches no other
         // checkout; deleted when the check ends. Not one per checkout: checks of one snapshot
         // share a checkout and run at once, and would create, then delete, each other's (seen
@@ -585,6 +736,18 @@ mod tests {
 
     fn refuse_secrets_t(p: &Policy) -> Result<Policy, String> {
         refuse_secrets(p, None)
+    }
+
+    #[test]
+    fn windows_arguments_are_quoted_as_programs_split_them() {
+        let q = |a: &str| quote_arg(OsStr::new(a));
+        assert_eq!(q("plain"), "plain");
+        assert_eq!(q(""), r#""""#);
+        assert_eq!(q("two words"), r#""two words""#);
+        assert_eq!(q(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(q(r"C:\dir with space\"), r#""C:\dir with space\\""#, "a trailing backslash is doubled before the quote");
+        assert_eq!(q(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(q(r"C:\no\spaces"), r"C:\no\spaces", "backslashes are literal without quotes");
     }
 
     #[test]
