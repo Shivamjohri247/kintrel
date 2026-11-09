@@ -1595,6 +1595,7 @@ dependencies = [
  "kintrel-ci",
  "kintrel-core",
  "kintrel-lang",
+ "rappct",
  "reflink-copy",
  "rmcp",
  "rusqlite",
