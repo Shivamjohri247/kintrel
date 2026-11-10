@@ -33,7 +33,7 @@ fn which_launches_can_start_programs() {
     env.extend(["TEMP", "TMP"].map(|k| (OsString::from(k), dir.join("tmp").into_os_string())));
     env.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
     let sec = SecurityCapabilitiesBuilder::new(&profile.sid).with_named(&["kintrelChecks"]).build().unwrap();
-    for (name, run) in programs {
+    for (name, run) in &programs {
         let opts = LaunchOptions {
             exe: sys.join("cmd.exe"),
             cmdline: Some(format!(" /D /S /C \"({run}) 2>&1\"")),
@@ -57,5 +57,19 @@ fn which_launches_can_start_programs() {
         report.push_str(&format!("{name}: {line}\n"));
     }
     profile.delete().ok();
+    // The same programs through the check sandbox's own launcher.
+    let policy = kintrel_ci::sandbox::Policy::default();
+    let env: Vec<(String, OsString)> = env.iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.clone())).collect();
+    for (name, run) in &programs {
+        let line = match kintrel_ci::sandbox::start(&format!("({run}) 2>&1"), Some(&dir), Some(&policy), &env) {
+            Ok(mut r) => {
+                let mut out = String::new();
+                r.output.read_to_string(&mut out).ok();
+                format!("ok={:?}: {}", r.wait(std::time::Duration::from_secs(10)), out.replace("\r\n", " | "))
+            }
+            Err(e) => format!("start failed: {e}"),
+        };
+        report.push_str(&format!("[sandbox::start] {name}: {line}\n"));
+    }
     panic!("diagnostics:\n{report}");
 }
