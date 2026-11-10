@@ -22,12 +22,14 @@ fn which_launches_can_start_programs() {
     std::fs::copy(sys.join("findstr.exe"), dir.join("f.exe")).unwrap();
     std::fs::write(dir.join("t.txt"), "hello\n").unwrap();
     let programs = [
-        ("findstr (System32)", format!("{}\\findstr.exe hello t.txt", sys.display())),
-        ("whoami (System32)", format!("{}\\whoami.exe", sys.display())),
-        ("child cmd", format!("{}\\cmd.exe /D /C echo child-ran", sys.display())),
-        ("findstr copy (granted dir)", format!("{}\\f.exe hello t.txt", dir.display())),
-        ("kintrel --version (build dir)", format!("{} --version", kintrel.display())),
-        ("kintrel copy --version (granted dir)", format!("{}\\k.exe --version", dir.display())),
+        ("findstr (bare name)", "findstr hello t.txt".to_string()),
+        ("findstr.exe (bare name)", "findstr.exe hello t.txt".to_string()),
+        ("full path, PATH's spelling", "C:\\Windows\\system32\\findstr.exe hello t.txt".to_string()),
+        ("full path via %SystemRoot%", "%SystemRoot%\\System32\\findstr.exe hello t.txt".to_string()),
+        ("copy in cwd, bare name", "f.exe hello t.txt".to_string()),
+        ("copy in cwd, .\\ prefix", ".\\f.exe hello t.txt".to_string()),
+        ("kintrel copy in cwd, bare name", "k.exe --version".to_string()),
+        ("whoami (bare name)", "whoami".to_string()),
     ];
     let mut report = String::new();
     let profile = AppContainerProfile::ensure(&format!("kintrel.diag.{}", std::process::id()), "Kintrel diag", Some("diag")).unwrap();
