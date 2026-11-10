@@ -25,7 +25,7 @@ Each proposal costs one model call, and it reaches head only through the same ga
 ## Platforms
 
 - **macOS and Linux:** fully supported; the test suite passes on both. Checks run in `sandbox-exec` on macOS and in bubblewrap (`bwrap`) on Linux, so install bubblewrap there.
-- **Windows:** the test suite passes on GitHub Actions' Windows runners; `kintrel agent` is not available there yet. The daemon talks over a named pipe, and checks run in `cmd` inside an AppContainer. Checks see no files in your profile unless their `kintrel.toml` entry lists them under `readable`, and no network unless `network = true`. A sandboxed check cannot redirect to `nul` (the AppContainer cannot open it): redirect to a file in the checkout instead.
+- **Windows:** the test suite passes on GitHub Actions' Windows runners. `kintrel agent` runs the agent in an AppContainer of its own. The daemon talks over a named pipe, and checks run in `cmd` inside an AppContainer. Checks see no files in your profile unless their `kintrel.toml` entry lists them under `readable`, and no network unless `network = true`. Two `cmd` limits apply inside the Windows sandbox, for checks and agents alike: redirecting to `nul` fails (the AppContainer cannot open it), and so does starting a program by an absolute path such as `C:\tools\x.exe`. Redirect to a file instead, and name programs by bare name on `PATH` or by a relative path.
 
 ## Build
 
@@ -64,7 +64,7 @@ Give each Claude Code instance its own view, and let a hook post every edit:
 cd "$(kintrel --repo /path/to/repo view create --agent claude-1)" && kintrel agent -- claude
 ```
 
-`kintrel agent` runs the agent sandboxed (macOS and Linux), and only inside a view, so it cannot act as you. It writes only its view, temp files and its own Claude Code config. It cannot read the key that approving `kintrel.toml` needs, and it cannot reach other local services that would run code for it (tmux, `open`, `osascript`, `systemd-run --user`, Docker). Agents get their own Claude Code config (`CLAUDE_CONFIG_DIR`), so a planted hook never reaches yours: log in once inside with `/login` (it cannot open your browser; open the URL it prints), or set `ANTHROPIC_API_KEY`. Use `--writable DIR` for directories a tool must write, such as a build cache.
+`kintrel agent` runs the agent sandboxed (Seatbelt on macOS, bubblewrap on Linux, an AppContainer on Windows), and only inside a view, so it cannot act as you. It writes only its view, temp files and its own Claude Code config. It cannot read the key that approving `kintrel.toml` needs, and it cannot reach other local services that would run code for it (tmux, `open`, `osascript`, `systemd-run --user`, Docker). Agents get their own Claude Code config (`CLAUDE_CONFIG_DIR`), so a planted hook never reaches yours: log in once inside with `/login` (it cannot open your browser; open the URL it prints), or set `ANTHROPIC_API_KEY`. Use `--writable DIR` for directories a tool must write, such as a build cache.
 
 Add this to `~/.claude/settings.json`. `kintrel hook` does nothing outside a view, so it is safe to install globally:
 

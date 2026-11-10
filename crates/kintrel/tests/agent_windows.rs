@@ -35,20 +35,18 @@ async fn agents_work_in_their_view_but_cannot_act_as_the_person() {
     // `kintrel agent` would grant.
     let kintrel = view.join("kintrel.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_kintrel"), &kintrel).unwrap();
-    // Diagnostics: a system program run from its own place and from a copy in the view.
     let system32 = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
-    std::fs::copy(system32.join("whoami.exe"), view.join("w.exe")).unwrap();
     let key = board::person_key(&repo).unwrap();
     let data = board::data_dir(&repo);
     let p = |p: &std::path::Path| p.display().to_string();
     let script = format!(
-        "echo ok> {v}\\ok.txt & type {k} > {v}\\key.txt 2>&1 & echo x> {b}\\x.txt & {sys}\\whoami.exe > {v}\\whoami-system.txt 2>&1 & {v}\\w.exe > {v}\\whoami-view.txt 2>&1 & {kin} --version > {v}\\version.txt 2>&1 & {kin} --repo {r} status > {v}\\status.txt 2>&1",
+        // Programs by relative name: in an AppContainer, cmd refuses to start one named by an
+        // absolute path (see kintrel-ci/tests/exit.rs).
+        "echo ok> {v}\\ok.txt & type {k} > {v}\\key.txt 2>&1 & echo x> {b}\\x.txt & kintrel.exe --repo {r} status > {v}\\status.txt 2>&1",
         v = p(&view),
         k = p(&key),
         b = p(&data),
-        kin = p(&kintrel),
         r = p(&repo),
-        sys = p(&system32),
     );
     let cmd = system32.join("cmd.exe");
     let argv = [cmd.into_os_string(), "/D".into(), "/C".into(), script.into()];
@@ -63,15 +61,7 @@ async fn agents_work_in_their_view_but_cannot_act_as_the_person() {
     let secret = std::fs::read_to_string(&key).unwrap();
     assert!(!read("key.txt").contains(secret.trim()), "the person key leaked");
     assert!(!data.join("x.txt").exists(), "the agent wrote the board");
-    let acl = std::process::Command::new("icacls").arg(&kintrel).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-    assert!(
-        read("status.txt").contains("promoted"),
-        "the daemon is reachable: {:?}\nversion: {:?}\nwhoami (System32): {:?}\nwhoami (view copy): {:?}\nkintrel.exe ACL: {acl}",
-        read("status.txt"),
-        read("version.txt"),
-        read("whoami-system.txt"),
-        read("whoami-view.txt")
-    );
+    assert!(read("status.txt").contains("promoted"), "the daemon is reachable: {:?}", read("status.txt"));
 
     std::fs::remove_dir_all(&runtime).ok();
     std::fs::remove_dir_all(&repo).ok();

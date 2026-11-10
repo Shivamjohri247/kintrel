@@ -31,8 +31,5 @@ workspace = true
 interprocess = { version = "2.4", features = ["tokio"] }
 widestring = "1"
 
-[target.'cfg(windows)'.dev-dependencies]
-rappct = "0.13"
-
 [dev-dependencies]
 rusqlite.workspace = true

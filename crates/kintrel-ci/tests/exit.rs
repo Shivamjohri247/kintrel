@@ -23,10 +23,13 @@ fn exit_codes_decide_pass_and_fail() {
     } else {
         vec![("ok", "cat marker.txt", true), ("exit", "exit 1", false), ("program", "grep -q zzz marker.txt", false)]
     };
-    // Known limit: an AppContainer cannot open NUL, so `>nul` fails a sandboxed check (seen on
-    // Windows CI); unsandboxed it works. Pinned here so a change is noticed.
+    // Known limits, both seen on Windows CI and pinned here so a change is noticed; unsandboxed
+    // both work. An AppContainer cannot open NUL, so `>nul` fails a sandboxed check. And cmd in
+    // an AppContainer refuses to start a program named by an absolute path ("Access is denied"),
+    // though the same program by bare name or relative path starts.
     if cfg!(windows) {
         cases.push(("nul", "echo x >nul", false));
+        cases.push(("absolute", "%SystemRoot%\\System32\\findstr.exe /C:FAIL marker.txt", false));
     }
     let mut config = String::new();
     for sandbox in [true, false] {
@@ -42,8 +45,8 @@ fn exit_codes_decide_pass_and_fail() {
     let root = board::init(&repo).unwrap();
     let st = State::open(&board::state_db(&repo)).unwrap();
     let out = Ci::open(&repo).unwrap().run(&st, &repo, config_of(&st, root).unwrap(), &Snapshot { root, ..Default::default() }, None).unwrap();
-    // `>nul` passes unsandboxed.
-    let expect = |check: &str, passes: bool| passes || check == "nul-false";
+    // The known limits pass unsandboxed.
+    let expect = |check: &str, passes: bool| passes || check == "nul-false" || check == "absolute-false";
     let wrong: Vec<_> = out
         .iter()
         .filter(|o| cases.iter().any(|(name, _, passes)| o.check.starts_with(&format!("{name}-")) && o.ok != expect(&o.check, *passes)))

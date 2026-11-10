@@ -32,7 +32,3 @@ jobs:
           git config --global user.email ci@ci
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
-      - name: Diagnostics (temporary) from a folder under LOCALAPPDATA
-        if: always() && runner.os == 'Windows'
-        shell: bash
-        run: KT_DIAG_DIR="$LOCALAPPDATA/kintrel/diag-$RANDOM" cargo test -p kintrel --test diag_windows -- --nocapture || true
