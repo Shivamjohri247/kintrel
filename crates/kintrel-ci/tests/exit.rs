@@ -15,7 +15,7 @@ fn exit_codes_decide_pass_and_fail() {
             ("ok", "type marker.txt", true),
             ("exit", "exit /b 1", false),
             ("program", "findstr /C:zzz marker.txt", false),
-            ("program-passes", "findstr /C:FAIL marker.txt", true),
+            ("found", "findstr /C:FAIL marker.txt", true),
             ("missing", "findstr /C:zzz no-such-file", false),
             // In cmd, `if c (a) & b` makes `b` part of the `if`; an `else` is the safe form.
             ("chained", "findstr /C:FAIL marker.txt & if errorlevel 1 (exit /b 0) else (exit /b 1)", false),
