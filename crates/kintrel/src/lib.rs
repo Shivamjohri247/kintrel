@@ -18,16 +18,19 @@ use crate::rpc::Client;
 
 /// Connects to the board's daemon, starting one in the background if none is running.
 pub async fn connect(repo: &Path) -> anyhow::Result<Client> {
-    let sock = daemon::socket_path(repo)?;
-    if let Ok(c) = Client::connect(&sock).await {
-        return Ok(c);
-    }
+    let sock = daemon::socket_path(repo).with_context(|| format!("resolving the board at {}", repo.display()))?;
+    let first = match Client::connect(&sock).await {
+        Ok(c) => return Ok(c),
+        Err(e) => e,
+    };
     if !kintrel_core::board::state_db(repo).exists() {
         bail!("{} is not a kintrel board (run `kintrel init`)", repo.display());
     }
     // A sandboxed agent cannot write the board, so it cannot start a daemon either.
     let log = std::fs::File::create(kintrel_core::board::data_dir(repo).join("daemon.log"))
-        .context("no daemon is running for this board, and this process cannot start one (a sandboxed agent cannot): run any kintrel command outside the sandbox first")?;
+        .with_context(|| {
+            format!("cannot reach the daemon ({first}), and this process cannot start one (a sandboxed agent cannot): run any kintrel command outside the sandbox first")
+        })?;
     let mut daemon = std::process::Command::new(std::env::current_exe()?);
     daemon
         .arg("--repo")

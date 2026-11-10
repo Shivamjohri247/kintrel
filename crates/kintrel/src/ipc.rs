@@ -56,8 +56,13 @@ pub async fn connect(endpoint: &Path) -> io::Result<ClientStream> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         const ERROR_PIPE_BUSY: i32 = 231;
         let refused = |why: &str| io::Error::new(io::ErrorKind::ConnectionRefused, why.to_owned());
-        let name = std::fs::read_to_string(endpoint.join("pipe")).map_err(|_| refused("no daemon has started"))?;
-        let key = std::fs::read_to_string(endpoint.join("key")).map_err(|_| refused("no daemon key"))?;
+        let read = |file: &str, absent: &str| match std::fs::read_to_string(endpoint.join(file)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(refused(absent)),
+            Err(e) => Err(io::Error::new(e.kind(), format!("reading {}: {e}", endpoint.join(file).display()))),
+            Ok(v) => Ok(v),
+        };
+        let name = read("pipe", "no daemon has started")?;
+        let key = read("key", "no daemon key")?;
         let name = name.trim();
         if !name.starts_with(r"\\.\pipe\kintrel-") {
             return Err(refused("bad pipe name"));
@@ -71,7 +76,8 @@ pub async fn connect(endpoint: &Path) -> io::Result<ClientStream> {
                 }
                 // No pipe yet reads as "nobody listening", like a refused socket.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(io::Error::new(io::ErrorKind::ConnectionRefused, e)),
-                r => break r?,
+                Err(e) => return Err(io::Error::new(e.kind(), format!("opening the daemon's pipe: {e}"))),
+                Ok(p) => break p,
             }
         };
         // Prove the other end is this user's daemon before sending anything (a session token).
