@@ -10,7 +10,10 @@ use std::io::Read;
 #[test]
 fn which_launches_can_start_programs() {
     let sys = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
-    let dir = std::env::temp_dir().join(format!("kt-diag-{}", std::process::id()));
+    let dir = match std::env::var("KT_DIAG_DIR") {
+        Ok(d) => std::path::PathBuf::from(d),
+        Err(_) => std::env::temp_dir().join(format!("kt-diag-{}", std::process::id())),
+    };
     std::fs::create_dir_all(dir.join("tmp")).unwrap();
     // As a check's: the Windows essentials, TEMP in a granted directory, sorted.
     let base = ["PATH", "PATHEXT", "SystemRoot", "windir", "SystemDrive", "COMSPEC", "USERPROFILE", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"];
