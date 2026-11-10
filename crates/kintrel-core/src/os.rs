@@ -94,9 +94,13 @@ pub fn read_symlink(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-/// The per-user cache directory: `$XDG_CACHE_HOME`, else `~/Library/Caches` (macOS),
-/// `~/.cache` (other Unix) or `%LOCALAPPDATA%` (Windows).
+/// The per-user cache directory: `$KINTREL_CACHE_DIR`, else `$XDG_CACHE_HOME`, else
+/// `~/Library/Caches` (macOS), `~/.cache` (other Unix) or `%LOCALAPPDATA%` (Windows).
 pub fn cache_dir() -> Option<PathBuf> {
+    // Set by `kintrel agent` on Windows, where an AppContainer's LOCALAPPDATA is its own.
+    if let Some(x) = std::env::var_os("KINTREL_CACHE_DIR") {
+        return Some(PathBuf::from(x));
+    }
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(PathBuf::from(x));
     }

@@ -638,6 +638,11 @@ mod appcontainer {
         for (k, v) in env {
             vars.insert(k.to_string_lossy().to_uppercase(), (k.clone(), v.clone()));
         }
+        // Windows gives an AppContainer its own LOCALAPPDATA, so Kintrel inside would look for
+        // its runtime directory there: name the person's (<cache>/kintrel/<board>) explicitly.
+        if let Some(cache) = p.socket.parent().and_then(Path::parent) {
+            vars.insert("KINTREL_CACHE_DIR".into(), ("KINTREL_CACHE_DIR".into(), cache.as_os_str().to_owned()));
+        }
         let cmdline = argv.iter().skip(1).fold(super::quote_arg(exe.as_os_str()), |line, a| format!("{line} {}", super::quote_arg(a)));
         // At a terminal the agent shares the console. Otherwise (a script, `claude -p`, CI) it
         // gets pipes copied to and from ours: an inherited launch passes no handles, which left
