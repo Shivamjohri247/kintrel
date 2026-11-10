@@ -3,17 +3,9 @@
 #![cfg(windows)]
 
 use rappct::launch::{JobLimits, LaunchOptions, StdioConfig, launch_in_container_with_io};
-use rappct::{AppContainerProfile, KnownCapability, SecurityCapabilitiesBuilder};
+use rappct::{AppContainerProfile, SecurityCapabilitiesBuilder};
 use std::ffi::OsString;
 use std::io::Read;
-
-struct Case {
-    name: &'static str,
-    full_env: bool,
-    internet: bool,
-    named: &'static str,
-    argv0: bool,
-}
 
 #[test]
 fn which_launches_can_start_programs() {
@@ -22,35 +14,31 @@ fn which_launches_can_start_programs() {
     std::fs::create_dir_all(dir.join("tmp")).unwrap();
     // As a check's: the Windows essentials, TEMP in a granted directory, sorted.
     let base = ["PATH", "PATHEXT", "SystemRoot", "windir", "SystemDrive", "COMSPEC", "USERPROFILE", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"];
-    let cases = [
-        Case { name: "as a check", full_env: false, internet: false, named: "kintrelChecks", argv0: false },
-        Case { name: "+ internet", full_env: false, internet: true, named: "kintrelChecks", argv0: false },
-        Case { name: "per-board capability", full_env: false, internet: false, named: "kintrelAgents.diag", argv0: false },
-        Case { name: "full environment", full_env: true, internet: false, named: "kintrelChecks", argv0: false },
-        Case { name: "argv0 in command line", full_env: false, internet: false, named: "kintrelChecks", argv0: true },
-        Case { name: "as an agent", full_env: true, internet: true, named: "kintrelAgents.diag", argv0: true },
+    let kintrel = std::path::PathBuf::from(env!("CARGO_BIN_EXE_kintrel"));
+    std::fs::copy(&kintrel, dir.join("k.exe")).unwrap();
+    std::fs::copy(sys.join("findstr.exe"), dir.join("f.exe")).unwrap();
+    std::fs::write(dir.join("t.txt"), "hello\n").unwrap();
+    let programs = [
+        ("findstr (System32)", format!("{}\\findstr.exe hello t.txt", sys.display())),
+        ("whoami (System32)", format!("{}\\whoami.exe", sys.display())),
+        ("child cmd", format!("{}\\cmd.exe /D /C echo child-ran", sys.display())),
+        ("findstr copy (granted dir)", format!("{}\\f.exe hello t.txt", dir.display())),
+        ("kintrel --version (build dir)", format!("{} --version", kintrel.display())),
+        ("kintrel copy --version (granted dir)", format!("{}\\k.exe --version", dir.display())),
     ];
     let mut report = String::new();
-    for (i, c) in cases.iter().enumerate() {
-        let profile = AppContainerProfile::ensure(&format!("kintrel.diag.{}.{i}", std::process::id()), "Kintrel diag", Some("diag")).unwrap();
-        std::process::Command::new("icacls").arg(&dir).args(["/grant", &format!("*{}:(OI)(CI)M", profile.sid.as_string()), "/T", "/C", "/Q"]).status().ok();
-        let mut env: Vec<(OsString, OsString)> = if c.full_env {
-            std::env::vars_os().collect()
-        } else {
-            base.iter().filter_map(|k| std::env::var_os(k).map(|v| (OsString::from(k), v))).collect()
-        };
-        env.retain(|(k, _)| !["TEMP", "TMP"].contains(&k.to_string_lossy().to_uppercase().as_str()));
-        env.extend(["TEMP", "TMP"].map(|k| (OsString::from(k), dir.join("tmp").into_os_string())));
-        env.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
-        let known = if c.internet { vec![KnownCapability::InternetClient] } else { vec![] };
-        let sec = SecurityCapabilitiesBuilder::new(&profile.sid).with_known(&known).with_named(&[c.named]).build().unwrap();
-        let script = format!("{}\\whoami.exe 2>&1 & echo exit=%errorlevel%", sys.display());
-        let cmdline = if c.argv0 { format!("{}\\cmd.exe /D /S /C \"{script}\"", sys.display()) } else { format!(" /D /S /C \"{script}\"") };
+    let profile = AppContainerProfile::ensure(&format!("kintrel.diag.{}", std::process::id()), "Kintrel diag", Some("diag")).unwrap();
+    std::process::Command::new("icacls").arg(&dir).args(["/grant", &format!("*{}:(OI)(CI)M", profile.sid.as_string()), "/T", "/C", "/Q"]).status().ok();
+    let mut env: Vec<(OsString, OsString)> = base.iter().filter_map(|k| std::env::var_os(k).map(|v| (OsString::from(k), v))).collect();
+    env.extend(["TEMP", "TMP"].map(|k| (OsString::from(k), dir.join("tmp").into_os_string())));
+    env.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
+    let sec = SecurityCapabilitiesBuilder::new(&profile.sid).with_named(&["kintrelChecks"]).build().unwrap();
+    for (name, run) in programs {
         let opts = LaunchOptions {
             exe: sys.join("cmd.exe"),
-            cmdline: Some(cmdline),
+            cmdline: Some(format!(" /D /S /C \"({run}) 2>&1\"")),
             cwd: Some(dir.clone()),
-            env: Some(env),
+            env: Some(env.clone()),
             stdio: StdioConfig::Pipe,
             join_job: Some(JobLimits { kill_on_job_close: true, ..Default::default() }),
             ..Default::default()
@@ -61,13 +49,13 @@ fn which_launches_can_start_programs() {
                 if let Some(mut o) = io.stdout.take() {
                     o.read_to_string(&mut out).ok();
                 }
-                let _ = io.wait(Some(std::time::Duration::from_secs(10)));
-                out.replace("\r\n", " | ")
+                let code = io.wait(Some(std::time::Duration::from_secs(10)));
+                format!("exit {code:?}: {}", out.replace("\r\n", " | "))
             }
             Err(e) => format!("launch failed: {e}"),
         };
-        report.push_str(&format!("{}: {line}\n", c.name));
-        profile.delete().ok();
+        report.push_str(&format!("{name}: {line}\n"));
     }
+    profile.delete().ok();
     panic!("diagnostics:\n{report}");
 }
