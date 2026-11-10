@@ -39,10 +39,9 @@ async fn agents_work_in_their_view_but_cannot_act_as_the_person() {
     let key = board::person_key(&repo).unwrap();
     let data = board::data_dir(&repo);
     let p = |p: &std::path::Path| p.display().to_string();
-    // The long, resolved path, as a view's marker records it: %TEMP% is an 8.3 short name on
-    // the runner, which the AppContainer cannot expand (that needs a listing of C:\Users).
+    // The canonical path (`\\?\C:\...`), as a view's marker records it: the AppContainer cannot
+    // canonicalize a path itself.
     let long = std::fs::canonicalize(&repo).unwrap();
-    let long = std::path::PathBuf::from(long.to_string_lossy().trim_start_matches(r"\\?\"));
     let script = format!(
         // Programs by relative name: in an AppContainer, cmd refuses to start one named by an
         // absolute path (see kintrel-ci/tests/exit.rs).

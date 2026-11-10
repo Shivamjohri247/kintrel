@@ -24,7 +24,14 @@ pub fn person_key(repo: &Path) -> Result<PathBuf> {
 }
 
 fn board_id(repo: &Path) -> Result<String> {
-    Ok(Hash::of(fs::canonicalize(repo)?.as_os_str().as_encoded_bytes()).short())
+    // A sandboxed agent on Windows cannot canonicalize (normalizing reads every folder on the
+    // way); the views it works in record the repository canonical already (`\\?\C:\...`).
+    let canon = match fs::canonicalize(repo) {
+        Ok(c) => c,
+        Err(_) if cfg!(windows) && repo.to_string_lossy().starts_with(r"\\?\") => repo.to_owned(),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(Hash::of(canon.as_os_str().as_encoded_bytes()).short())
 }
 
 /// What a person sends to approve head's config `theirs` over the promoted `trusted`: a hash
