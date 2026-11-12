@@ -227,7 +227,7 @@ impl KintrelMcp {
 
     #[tool(description = "Write a whole file (content null deletes it). Posting never blocks; other agents' concurrent edits to other symbols merge.")]
     async fn kintrel_write_file(&self, Parameters(a): Parameters<WriteArgs>) -> Result<CallToolResult, McpError> {
-        self.post(vec![FileWrite { path: a.path, content: a.content, base: None }]).await
+        self.post(vec![FileWrite { path: a.path, content: a.content, base: None, binary: None }]).await
     }
 
     #[tool(description = "Replace one symbol (function, method, class, ...) by its atom key and post the change.")]
@@ -239,7 +239,7 @@ impl KintrelMcp {
         // models naturally send text ending in one: don't let it add a blank line.
         let body = if f.content[start..end].ends_with('\n') { &a.content[..] } else { a.content.trim_end_matches('\n') };
         let new = format!("{}{}{}", &f.content[..start], body, &f.content[end..]);
-        self.post(vec![FileWrite { path: key.path, content: Some(new), base: Some(f.hash) }]).await
+        self.post(vec![FileWrite { path: key.path, content: Some(new), base: Some(f.hash), binary: None }]).await
     }
 
     #[tool(description = "Board status: head, promoted root, notes, open conflicts, files blocking promotion.")]

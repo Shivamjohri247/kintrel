@@ -19,7 +19,7 @@ async fn session(sock: &Path, agent: &str) -> (Client, String) {
 }
 
 async fn post(c: &mut Client, token: &str, path: &str, content: &str) {
-    let files = vec![FileWrite { path: path.into(), content: Some(content.into()), base: None }];
+    let files = vec![FileWrite { path: path.into(), content: Some(content.into()), base: None, binary: None }];
     let _: Posted = c.call(proto::POST, &Post { token: token.into(), files, summary: None }).await.unwrap();
 }
 
@@ -198,7 +198,7 @@ async fn revert_undoes_only_that_note() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let (mut a, ta) = session(&sock, "a").await;
-    let files = |c: &str| vec![FileWrite { path: "a.py".into(), content: Some(c.into()), base: None }];
+    let files = |c: &str| vec![FileWrite { path: "a.py".into(), content: Some(c.into()), base: None, binary: None }];
     let fee = A.replace("return 1", "return 2");
     let n1: Posted = a.call(proto::POST, &Post { token: ta.clone(), files: files(&fee), summary: None }).await.unwrap();
     let both = fee.replace("return x", "return x * 2");

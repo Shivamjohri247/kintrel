@@ -144,6 +144,15 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<std::ffi::OsString>,
     },
+    /// The board's notes, newest first: who wrote what, and what became of it.
+    Log {
+        /// Only this agent's notes.
+        #[arg(long)]
+        author: Option<String>,
+        /// How many notes to show.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: u32,
+    },
     /// Bring new Git commits into the board: each becomes notes, merged into head like an
     /// agent's edits (Kintrel's own exports are skipped).
     Sync {
@@ -171,6 +180,8 @@ enum DaemonCmd {
         #[arg(long, default_value_t = 1000)]
         promote_every_ms: u64,
     },
+    /// Print the daemon's metrics (Prometheus text format).
+    Metrics,
 }
 
 #[derive(Subcommand)]
@@ -212,6 +223,10 @@ async fn main() -> anyhow::Result<()> {
                 DurabilityArg::Full => Durability::Full,
             };
             let promote_every = (promote_every_ms > 0).then(|| Duration::from_millis(promote_every_ms));
+            // Logs to stderr (daemon.log when the CLI starts the daemon); `KINTREL_LOG=debug`.
+            let filter = tracing_subscriber::EnvFilter::try_from_env("KINTREL_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+            let colour = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_ansi(colour).init();
             exit_when_board_goes(&cli.repo)?;
             daemon::run(Options { repo: cli.repo, durability, promote_every }).await?;
         }
@@ -258,6 +273,10 @@ async fn main() -> anyhow::Result<()> {
             }
             let code = kintrel_ci::sandbox::run_agent(&command, &policy, &env, &std::env::current_dir()?).map_err(anyhow::Error::msg)?;
             std::process::exit(code);
+        }
+        Cmd::Daemon { cmd: DaemonCmd::Metrics } => {
+            let text: String = connect(&cli.repo).await?.call(proto::METRICS, &serde_json::json!({})).await?;
+            print!("{text}");
         }
         Cmd::Promote { approve_config } => {
             let (approve_config, approval) = match approve_config {
@@ -473,8 +492,17 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 let root = |r: Option<Hash>| r.map_or("none".into(), |h| h.short());
                 println!(
-                    "sessions  {}\nnotes     {} ({} folded, last pass {} ms)\nhead      {}\npromoted  {}\nconflicts {}",
-                    s.sessions, s.notes, s.folded, s.pass_ms, root(s.head), root(s.promoted), s.conflicts
+                    "sessions  {}\nnotes     {} ({} folded, last pass {} ms)\nhead      {}\npromoted  {} ({} behind head{})\nconflicts {}\nchecks    {} pending",
+                    s.sessions,
+                    s.notes,
+                    s.folded,
+                    s.pass_ms,
+                    root(s.head),
+                    root(s.promoted),
+                    if s.unpromoted == 1 { "1 note".to_string() } else { format!("{} notes", s.unpromoted) },
+                    if s.unpromoted > 0 { format!(", waiting {} s", s.promotion_wait_ms / 1000) } else { String::new() },
+                    s.conflicts,
+                    s.ci_pending
                 );
                 if !s.blocked.is_empty() {
                     println!("promotion blocked: {} do not parse", s.blocked.join(", "));
@@ -496,6 +524,16 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::json!({ "root": root }));
             } else {
                 println!("initialized board at {} (root {})", cli.repo.display(), root.short());
+            }
+        }
+        Cmd::Log { author, limit } => {
+            let st = kintrel_core::state::State::open_with_log(&kintrel_core::board::state_db(&cli.repo), &kintrel_core::board::log_db(&cli.repo))?;
+            let entries = st.log(author.as_deref(), limit)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&entries)?);
+            }
+            for e in entries.iter().filter(|_| !cli.json) {
+                println!("{:>6} {} {:<10} {:<20} {}", e.gseq, e.id.short(), e.state, e.author, e.paths.join(" "));
             }
         }
         Cmd::Sync { branch, since } => {
@@ -567,7 +605,7 @@ async fn post_view(dir: &Path, paths: Option<&[String]>) -> anyhow::Result<Optio
     }
     let files = changes
         .iter()
-        .map(|c| proto::FileWrite { path: c.path.clone(), content: c.content.clone(), base: Some(c.base) })
+        .map(|c| proto::FileWrite::bytes(c.path.clone(), c.content.clone(), Some(c.base)))
         .collect();
     let post = proto::Post { token: marker.token.clone(), files, summary: None };
     let posted: proto::Posted = connect(&marker.repo).await?.call(proto::POST, &post).await?;
@@ -607,7 +645,7 @@ fn exit_when_board_goes(repo: &Path) -> anyhow::Result<()> {
     std::thread::Builder::new().name("kintrel-watchdog".into()).spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));
         if std::fs::metadata(&db).map(ident).ok() != Some(opened) {
-            eprintln!("kintrel: {} is gone or was replaced; exiting", db.display());
+            tracing::warn!("{} is gone or was replaced; exiting", db.display());
             std::process::exit(0);
         }
     })?;

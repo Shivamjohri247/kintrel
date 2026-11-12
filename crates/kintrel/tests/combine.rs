@@ -18,7 +18,7 @@ async fn session(sock: &Path, agent: &str) -> (Client, String) {
 }
 
 async fn post(c: &mut Client, token: &str, content: String) {
-    let files = vec![FileWrite { path: "a.py".into(), content: Some(content), base: None }];
+    let files = vec![FileWrite { path: "a.py".into(), content: Some(content), base: None, binary: None }];
     let _: Posted = c.call(proto::POST, &Post { token: token.into(), files, summary: None }).await.unwrap();
 }
 

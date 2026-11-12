@@ -62,7 +62,7 @@ async fn gate_blocks_and_feedback_is_fast() {
     let s: SessionStarted = c.call(proto::SESSION_START, &SessionStart { agent: "a".into(), rank_hint: None, base: None }).await.unwrap();
     let post = |text: &str| Post {
         token: s.token.clone(),
-        files: vec![FileWrite { path: "a.txt".into(), content: Some(text.into()), base: None }],
+        files: vec![FileWrite { path: "a.txt".into(), content: Some(text.into()), base: None, binary: None }],
         summary: None,
     };
 
@@ -116,7 +116,7 @@ async fn gate_blocks_and_feedback_is_fast() {
     let marker = std::env::temp_dir().join(format!("kt-ci-pwned-{}", std::process::id()));
     std::fs::remove_file(&marker).ok();
     let evil = format!("[[check]]\nname = \"x\"\nscope = \"repo\"\nrun = 'touch {}'\ninputs = [\"**\"]\n", marker.display());
-    let files = vec![FileWrite { path: "kintrel.toml".into(), content: Some(evil.clone()), base: None }];
+    let files = vec![FileWrite { path: "kintrel.toml".into(), content: Some(evil.clone()), base: None, binary: None }];
     let _: Posted = c.call(proto::POST, &Post { token: s.token.clone(), files, summary: None }).await.unwrap();
     let st: StatusInfo = c.call(proto::PROMOTE_NOW, &proto::PromoteNow::default()).await.unwrap();
     assert_eq!(st.failing, [kintrel::ci_worker::UNAPPROVED_CONFIG]);
@@ -167,7 +167,7 @@ async fn board(name: &str, config: &str, files: &[(&str, &str)]) -> (std::path::
 
 async fn write(c: &mut Client, agent: &str, path: &str, text: &str) -> (String, Posted) {
     let s: SessionStarted = c.call(proto::SESSION_START, &SessionStart { agent: agent.into(), rank_hint: None, base: None }).await.unwrap();
-    let files = vec![FileWrite { path: path.into(), content: Some(text.into()), base: None }];
+    let files = vec![FileWrite { path: path.into(), content: Some(text.into()), base: None, binary: None }];
     let p: Posted = c.call(proto::POST, &Post { token: s.token.clone(), files, summary: None }).await.unwrap();
     (s.token, p)
 }
@@ -228,7 +228,7 @@ async fn deploys_and_the_backstop() {
 
     // A failure only the full suite sees slips through the gate; the 20th promotion's backstop
     // run catches it and everyone is told. Until a candidate passes everything, none promotes.
-    let post = |t: &str| Post { token: token.clone(), files: vec![FileWrite { path: "a.txt".into(), content: Some(t.into()), base: None }], summary: None };
+    let post = |t: &str| Post { token: token.clone(), files: vec![FileWrite { path: "a.txt".into(), content: Some(t.into()), base: None, binary: None }], summary: None };
     let _: Posted = c.call(proto::POST, &post("FAIL\n")).await.unwrap();
     let _: StatusInfo = c.call(proto::PROMOTE_NOW, &proto::Status {}).await.unwrap();
     for i in 2..kintrel::ci_worker::BACKSTOP_EVERY {

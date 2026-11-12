@@ -43,7 +43,7 @@ async fn a_conflict_gets_a_proposal_that_resolves_it() {
     let (mut e, te) = session(&sock, "e").await;
     let post = |token: &str, text: &str| Post {
         token: token.into(),
-        files: vec![FileWrite { path: "a.py".into(), content: Some(text.into()), base: None }],
+        files: vec![FileWrite { path: "a.py".into(), content: Some(text.into()), base: None, binary: None }],
         summary: None,
     };
     let _: Posted = e.call(proto::POST, &post(&te, &A.replace("return 1", "return 3"))).await.unwrap();

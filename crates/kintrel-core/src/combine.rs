@@ -115,6 +115,7 @@ pub fn fold(src: &dyn Source, notes: &[(Hash, Note)]) -> Result<Folded> {
                 Op::Delete { base, .. } => (Some(*base), None),
             };
             let result = if cur.map(|c| c.1) == base {
+                crate::metrics::FAST_APPLIES.add(1);
                 new // Tier 0: the note was written against exactly what head has.
             } else {
                 let mut get = |h: Option<Hash>| -> Result<Option<Vec<u8>>> {
@@ -293,6 +294,10 @@ pub struct Heads {
     pub failing: Vec<String>,
     /// Passes so far, so a caller can wait for one that started after its request.
     pub passes: u64,
+    /// Every note up to this `gseq` is decided (the promoted mark).
+    pub promoted_gseq: u64,
+    /// When the promoted root last changed, in milliseconds since the Unix epoch (0: not yet).
+    pub promoted_ms: u64,
 }
 
 /// The gate's checks beyond parsing (SPEC §9.2), answered without blocking the combiner.
@@ -352,8 +357,11 @@ impl Combiner {
                         return;
                     }
                     let due = promote_every.is_some_and(|d| last.elapsed() >= d);
+                    let span = tracing::debug_span!("pass").entered();
+                    let started = Instant::now();
                     match pass(&mut st, &heads, forced.swap(false, Ordering::AcqRel) || due, gate.as_deref(), &mut rejected) {
                         Ok(out) => {
+                            tracing::debug!(notes = out.notes.len(), promoted = out.promoted, ms = started.elapsed().as_millis() as u64, "pass done");
                             if out.promoted {
                                 last = Instant::now();
                             }
@@ -368,12 +376,13 @@ impl Combiner {
                                     Ok(ev) => {
                                         let _ = tx.send(ev);
                                     }
-                                    Err(e) => eprintln!("kintrel combiner: notices failed: {e}"),
+                                    Err(e) => tracing::error!("notices failed: {e}"),
                                 }
                             }
                         }
-                        Err(e) => eprintln!("kintrel combiner: pass failed: {e}"),
+                        Err(e) => tracing::error!("pass failed: {e}"),
                     }
+                    drop(span);
                 }
             })
             .expect("spawn combiner thread");
@@ -433,6 +442,7 @@ fn pass(
     {
         let head = st.get_ref(state::HEAD)?.ok_or_else(|| Error::Corrupt("no head ref".into()))?;
         st.promote_to(head, root, gseq)?;
+        crate::metrics::PROMOTIONS.add(1);
         (promoted, mark) = (root, gseq);
         gate.expect("a gate passed it").promoted(root);
     }
@@ -462,7 +472,8 @@ fn pass(
         Ok(head)
     })?;
     // The checks gate runs once head is committed, so the CI side can read it.
-    // ponytail: promote the whole pass or nothing; partitioned promotion (SPEC §9.1) is step 4.
+    // ponytail: promote the whole pass or nothing; partitioned promotion (SPEC §9.1) is not built,
+    // since rejection already keeps one bad note from holding everyone back.
     let mut failing = vec![];
     let mut gate_pending = false;
     let promote = may_promote
@@ -481,13 +492,18 @@ fn pass(
         };
     if promote {
         st.promote_to(head, head, high)?;
-        promoted = head;
+        crate::metrics::PROMOTIONS.add(1);
+        (promoted, mark) = (head, high);
         if let Some(g) = gate {
             g.promoted(head);
         }
     }
     // Its own statement: a guard taken inside the assignment below would live to its end.
-    let passes = heads.lock().unwrap().passes + 1;
+    let before = heads.lock().unwrap().clone();
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let promoted_ms = if promoted != before.promoted { now_ms } else { before.promoted_ms };
+    let passes = before.passes + 1;
+    crate::metrics::COMBINER_PASS_MS.add(start.elapsed().as_millis() as u64);
     *heads.lock().unwrap() = Heads {
         head,
         promoted,
@@ -497,6 +513,8 @@ fn pass(
         blocked,
         failing,
         passes,
+        promoted_gseq: mark,
+        promoted_ms,
     };
     Ok(PassOut { promoted: promote, gate_pending, head, notes, folded })
 }
@@ -504,7 +522,7 @@ fn pass(
 /// The Phase 1 gate (SPEC §9.2): every changed file in a supported language parses. A failure
 /// holds promotion back until a later note fixes the file; nothing is rejected yet, because
 /// agents post after every edit and a half-finished edit is normal.
-// ponytail: block-and-report; rejection by bisection arrives with real checks (Phase 3).
+// (Failing gate checks, by contrast, are rejected by bisection in the CI worker.)
 fn parse_gate(st: &State, folded: &Folded) -> Result<Vec<String>> {
     let mut blocked = vec![];
     for (path, state) in &folded.files {

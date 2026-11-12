@@ -139,7 +139,7 @@ pub fn export(st: &State, git_dir: &Path, root: Hash, branch: &str) -> anyhow::R
             .unwrap_or(0);
         message.push_str(&format!("Kintrel-Gseq: {upto}\n"));
         let notes: Vec<_> = st.promoted_between(after, upto)?.into_iter().filter(|(_, author)| author != SYNC_AGENT).collect();
-        // ponytail: capped so a long-unexported board stays a readable message; `kintrel log` would list all.
+        // Capped so a long-unexported board stays a readable message; `kintrel log` lists all.
         const SHOWN: usize = 200;
         for (id, author) in notes.iter().take(SHOWN) {
             // Names are checked at session start; control characters are dropped all the same.

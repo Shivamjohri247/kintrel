@@ -365,6 +365,7 @@ impl Interest {
             if old.after.is_some() {
                 (old.kind, old.action) = change_kind(old.before != old.after);
             }
+            kintrel_core::metrics::NOTICES_COALESCED.add(1);
             return;
         }
         let now = Instant::now();
@@ -373,9 +374,11 @@ impl Interest {
         }
         if self.sent >= RATE {
             self.overflow.insert(n.atom);
+            kintrel_core::metrics::NOTICES_OVER_RATE.add(1);
             return;
         }
         self.sent += 1;
+        kintrel_core::metrics::NOTICES_SENT.add(1);
         self.inbox.push(n);
     }
 

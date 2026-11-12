@@ -52,6 +52,20 @@ pub fn merge3_tier(
     ours: Option<&[u8]>,
     theirs: Option<&[u8]>,
 ) -> Result<(Option<Vec<u8>>, Tier), Vec<AtomKey>> {
+    let r = merge3_tier_uncounted(path, base, ours, theirs);
+    match &r {
+        Ok((_, tier)) => crate::metrics::MERGES[*tier as usize].add(1),
+        Err(_) => crate::metrics::MERGE_CONFLICTS.add(1),
+    }
+    r
+}
+
+fn merge3_tier_uncounted(
+    path: &str,
+    base: Option<&[u8]>,
+    ours: Option<&[u8]>,
+    theirs: Option<&[u8]>,
+) -> Result<(Option<Vec<u8>>, Tier), Vec<AtomKey>> {
     if ours == theirs || base == theirs {
         return Ok((ours.map(<[u8]>::to_vec), Tier::Trivial));
     }

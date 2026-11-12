@@ -37,7 +37,7 @@ pub type Manifest = BTreeMap<String, Stamp>;
 /// One file whose view content differs from the manifest. `content: None` means deleted.
 pub struct Change {
     pub path: String,
-    pub content: Option<String>,
+    pub content: Option<Vec<u8>>,
     /// The hash at the last sync, or `Hash::default()` for a new file (asserts it is absent).
     pub base: Hash,
 }
@@ -116,7 +116,6 @@ pub fn find(start: &Path) -> anyhow::Result<(PathBuf, Marker)> {
 }
 
 /// Files that differ from the manifest: only `paths` (view-relative) if given, else a full scan.
-/// Binary and non-UTF-8 files are skipped with a warning (the wire protocol is text-only).
 pub fn changes(view: &Path, paths: Option<&[String]>) -> anyhow::Result<Vec<Change>> {
     let manifest = load_manifest(view)?;
     let candidates: Vec<String> = match paths {
@@ -151,10 +150,7 @@ pub fn changes(view: &Path, paths: Option<&[String]>) -> anyhow::Result<Vec<Chan
         if old.is_some_and(|s| s.hash == Hash::of(&bytes)) {
             continue;
         }
-        match String::from_utf8(bytes) {
-            Ok(content) => out.push(Change { path, content: Some(content), base: old.map_or(Hash::default(), |s| s.hash) }),
-            Err(_) => eprintln!("kintrel: skipping {path}: not UTF-8 text"),
-        }
+        out.push(Change { path, content: Some(bytes), base: old.map_or(Hash::default(), |s| s.hash) });
     }
     Ok(out)
 }
@@ -165,8 +161,8 @@ pub fn mark_posted(view: &Path, posted: &[Change]) -> anyhow::Result<()> {
     let mut manifest = load_manifest(view)?;
     for c in posted {
         match &c.content {
-            Some(text) => {
-                manifest.insert(c.path.clone(), stamp(&view.join(&c.path), Hash::of(text.as_bytes()))?);
+            Some(bytes) => {
+                manifest.insert(c.path.clone(), stamp(&view.join(&c.path), Hash::of(bytes))?);
             }
             None => {
                 manifest.remove(&c.path);

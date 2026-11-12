@@ -32,6 +32,20 @@ CREATE TABLE IF NOT EXISTS marks      (name TEXT PRIMARY KEY, value INTEGER) WIT
 /// `marks` row: every note with `gseq` at or below it is decided (promoted, or conflicted for good).
 pub const PROMOTED_GSEQ: &str = "promoted_gseq";
 
+/// One note in [`State::log`].
+#[derive(Debug, serde::Serialize)]
+pub struct LogEntry {
+    pub gseq: u64,
+    pub id: Hash,
+    pub author: String,
+    pub session: u64,
+    /// When the log took it, in milliseconds since the Unix epoch.
+    pub posted_ms: i64,
+    /// posted, applied, conflicted, promoted or rejected.
+    pub state: &'static str,
+    pub paths: Vec<String>,
+}
+
 /// `note_state.state` values (SPEC §4.4). A note with no row is Posted.
 pub const APPLIED: i64 = 1;
 pub const CONFLICTED: i64 = 2;
@@ -352,6 +366,40 @@ impl State {
     }
 
     /// `note_state.state` for a note, `None` if the combiner has not recorded it.
+    /// The log, newest first (SPEC §14: provenance is always queryable): at most `limit` notes,
+    /// only `author`'s if given. Needs the log attached.
+    pub fn log(&self, author: Option<&str>, limit: u32) -> Result<Vec<LogEntry>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT l.gseq, l.id, l.author, l.session, l.posted_at, COALESCE(s.state, 0), l.body
+             FROM log.notes l LEFT JOIN note_state s ON s.note = l.id
+             WHERE ?1 IS NULL OR l.author = ?1 ORDER BY l.gseq DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![author, limit], |r| {
+            Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)?, r.get::<_, Vec<u8>>(6)?))
+        })?;
+        rows.map(|row| {
+            let (gseq, id, author, session, posted_ms, state, body) = row?;
+            let note: crate::note::Note = encode::decode(&body).map_err(|_| Error::Corrupt("note body".into()))?;
+            let state = match state {
+                APPLIED => "applied",
+                CONFLICTED => "conflicted",
+                PROMOTED_NOTE => "promoted",
+                REJECTED => "rejected",
+                _ => "posted",
+            };
+            Ok(LogEntry {
+                gseq,
+                id: Hash(<[u8; 32]>::try_from(id.as_slice()).map_err(|_| Error::Corrupt("note id".into()))?),
+                author,
+                session,
+                posted_ms,
+                state,
+                paths: note.ops.iter().map(|op| op.path().to_owned()).collect(),
+            })
+        })
+        .collect()
+    }
+
     pub fn note_state(&self, note: Hash) -> Result<Option<i64>> {
         Ok(self
             .conn

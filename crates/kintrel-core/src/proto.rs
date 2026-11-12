@@ -21,12 +21,16 @@ pub const SESSION_END: &str = "session.end";
 pub const REVERT: &str = "revert";
 pub const CHECKS_RUN: &str = "checks.run";
 pub const SYNC: &str = "git.sync";
+/// Admin call: Prometheus text for `kintrel daemon metrics` (SPEC §15).
+pub const METRICS: &str = "metrics";
 
 /// Largest frame either side accepts.
 pub const MAX_FRAME: u32 = 64 << 20;
 /// Note limits (SPEC §4.3).
 pub const MAX_BLOB: usize = 1 << 20;
 pub const MAX_OPS: usize = 256;
+/// Posts one session may make per second (SPEC §14); more are answered `BUSY`.
+pub const MAX_POSTS_PER_SEC: u32 = 200;
 /// Intent and claim summaries (SPEC §4.3).
 pub const MAX_SUMMARY: usize = 4 << 10;
 
@@ -159,8 +163,9 @@ pub struct Post {
     pub summary: Option<String>,
 }
 
-/// Whole new contents of one file (`None` deletes it); the daemon derives the atoms (SPEC §4.3).
-// ponytail: UTF-8 only; binary content needs a bytes encoding before Phase 1 ships.
+/// Whole new contents of one file; the daemon derives the atoms (SPEC §4.3). Text goes in
+/// `content`; a file that is not UTF-8 (an image, say) goes in `binary`, hex-encoded. Neither
+/// deletes the file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileWrite {
     pub path: String,
@@ -169,6 +174,37 @@ pub struct FileWrite {
     /// still has this hash (`Hash::default()` asserts the file is absent).
     #[serde(default)]
     pub base: Option<Hash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+}
+
+impl FileWrite {
+    /// A write of `bytes` (`None` deletes): as text if it is UTF-8, else hex-encoded.
+    pub fn bytes(path: String, bytes: Option<Vec<u8>>, base: Option<Hash>) -> FileWrite {
+        match bytes.map(String::from_utf8) {
+            None => FileWrite { path, content: None, base, binary: None },
+            Some(Ok(text)) => FileWrite { path, content: Some(text), base, binary: None },
+            Some(Err(e)) => {
+                let hex = e.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+                FileWrite { path, content: None, base, binary: Some(hex) }
+            }
+        }
+    }
+
+    /// The new contents (`None`: delete), decoded; `Err` names what is wrong.
+    pub fn new_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        match (&self.content, &self.binary) {
+            (Some(_), Some(_)) => Err(format!("{:?}: set content or binary, not both", self.path)),
+            (Some(text), None) => Ok(Some(text.clone().into_bytes())),
+            (None, None) => Ok(None),
+            (None, Some(hex)) => {
+                let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+                let pairs = hex.as_bytes().chunks(2);
+                let bytes: Option<Vec<u8>> = pairs.map(|p| Some(digit(*p.first()?)? << 4 | digit(*p.get(1)?)?)).collect();
+                bytes.map(Some).ok_or_else(|| format!("{:?}: binary is not hex", self.path))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -209,6 +245,14 @@ pub struct StatusInfo {
     /// Notes folded into head by the latest pass; `notes - folded` is the combiner lag.
     #[serde(default)]
     pub folded: u64,
+    /// Notes in head not yet promoted, and how long promotion has waited for them (ms).
+    #[serde(default)]
+    pub unpromoted: u64,
+    #[serde(default)]
+    pub promotion_wait_ms: u64,
+    /// Gate and feedback check runs queued or running, plus deploys waiting.
+    #[serde(default)]
+    pub ci_pending: u64,
     #[serde(default)]
     pub pass_ms: u64,
     /// Files in head that fail the gate and hold up promotion.

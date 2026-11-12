@@ -2,7 +2,7 @@
 
 Version control for AI agents. Many agents edit one repository at once. Each edit is posted as a note, and posting never blocks. A combiner folds the notes into one head, merging per symbol (function, method, class member). What cannot be merged is kept as an explicit conflict.
 
-**Status:** Phases 1–3 are done, Phase 4 is in progress.
+**Status:** Phases 1–4 are done.
 - **Phase 1:** the board, symbol-level merge, views, the Claude Code hook, MCP, and Git import/export.
 - **Phase 2:** notices, intents, claims, conflict resolution and revert.
 - **Phase 3:** CI from `kintrel.toml`:
@@ -10,10 +10,11 @@ Version control for AI agents. Many agents edit one repository at once. Each edi
   - a gate that rejects the note that broke it, found by bisection;
   - lint feedback in milliseconds;
   - deploy hooks on promoted roots only.
+- **Phase 4:** sandboxed checks and sandboxed agents on macOS, Linux and Windows (agents cannot approve their own config changes), LLM merge proposals, Git sync, and observability (`kintrel log`, metrics, `KINTREL_LOG`).
 
-Symbol-level support exists for Rust, Python, TypeScript/TSX, JavaScript, Go and Java; every other text file merges at line level. Untracked files that `.gitignore` excludes are never posted from a view.
+Symbol-level support exists for Rust, Python, TypeScript/TSX, JavaScript, Go and Java; every other text file merges at line level, and binary files are kept byte for byte. Untracked files that `.gitignore` excludes are never posted from a view.
 
-**Phase 4 (in progress):** sandboxed checks on macOS, Linux and Windows, LLM merge proposals, and sandboxed agents that cannot approve their own config changes. To have Claude propose a merge for each conflict, add this to `kintrel.toml`:
+To have Claude propose a merge for each conflict, add this to `kintrel.toml`:
 
 ```toml
 [merge]
@@ -47,14 +48,18 @@ kintrel view refresh                  # pull in everyone else's work
 kintrel inbox [--follow]              # notices: others' changes to code you touched
 kintrel claim -m "reworking pricing" "src/cart.rs::impl Cart"  # advisory, leased
 kintrel intent -m "price() takes a currency" "src/cart.rs::impl Cart::fn price"
-kintrel status                        # head, notes, open conflicts
+kintrel status                        # head, promotion lag, open conflicts, checks pending
+kintrel log [--author worker-1]       # who wrote what, and what became of it
 kintrel conflicts                     # what could not be merged (redo the change to resolve)
 kintrel revert <note>                 # undo one note's symbols, keep later work
 kintrel checks [--tier lint]          # run kintrel.toml checks on your view (cached by content, sandboxed)
 kintrel packages                      # packages and the dependencies Kintrel infers
 kintrel read src/lib.rs               # a file at head (or your view, inside one)
 kintrel symbols src/lib.rs            # the atoms Kintrel tracks in a file
+kintrel daemon metrics                # Prometheus text: posts, merges by tier, notices, checks, gate
 ```
+
+The daemon logs to `.kintrel/daemon.log`; set `KINTREL_LOG=debug` (or `kintrel=debug`, any `tracing` filter) before it starts for a line per request and per combiner pass. A session may post 200 times a second; more are answered `BUSY` with a retry time.
 
 ## With Claude Code
 

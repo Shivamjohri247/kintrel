@@ -14,6 +14,7 @@ pub mod proto;
 pub mod state;
 pub mod tier2;
 pub mod tier3;
+pub mod metrics;
 pub mod tree;
 pub mod worktree;
 

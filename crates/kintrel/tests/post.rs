@@ -38,7 +38,7 @@ async fn session(sock: &std::path::Path, agent: &str) -> (Client, String) {
 }
 
 fn write(path: &str, content: Option<&str>, base: Option<Hash>) -> FileWrite {
-    FileWrite { path: path.into(), content: content.map(Into::into), base }
+    FileWrite { path: path.into(), content: content.map(Into::into), base, binary: None }
 }
 
 async fn post(c: &mut Client, token: &str, files: Vec<FileWrite>) -> Result<Posted, CallError> {
@@ -131,6 +131,45 @@ async fn post_path() {
     let second: Vec<u8> = db.query_row("SELECT body FROM notes WHERE gseq = 2", [], |r| r.get(0)).unwrap();
     let second: kintrel_core::note::Note = kintrel_core::encode::decode(&second).unwrap();
     assert_eq!(second.parents, [note.id()], "each note depends on the author's previous one");
+
+    // A binary file (not UTF-8) travels hex-encoded and lands byte for byte; a bad encoding
+    // is refused.
+    let (mut c, token) = session(&sock, "binary").await;
+    let png = vec![0x89, b'P', b'N', b'G', 0, 0xff, 0x10];
+    let files = vec![FileWrite::bytes("img/logo.png".into(), Some(png.clone()), None)];
+    assert!(files[0].content.is_none() && files[0].binary.is_some());
+    let _: Posted = c.call(proto::POST, &Post { token: token.clone(), files, summary: None }).await.unwrap();
+    // Folded but not promoted: the status shows the lag.
+    let waiting = loop {
+        let st: proto::StatusInfo = c.call(proto::STATUS, &proto::Status {}).await.unwrap();
+        if st.folded == st.notes {
+            break st;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(waiting.unpromoted >= 1, "{waiting:?}");
+    let st: proto::StatusInfo = c.call(proto::PROMOTE_NOW, &proto::PromoteNow::default()).await.unwrap();
+    assert_eq!(st.unpromoted, 0, "{st:?}");
+    // Metrics: the posts, the promotion and the merges this test made.
+    let text: String = c.call(proto::METRICS, &serde_json::json!({})).await.unwrap();
+    let value = |name: &str| -> u64 {
+        let line = text.lines().find(|l| l.starts_with(name)).unwrap_or_else(|| panic!("{name} in {text}"));
+        line.rsplit(' ').next().unwrap().parse().unwrap()
+    };
+    assert!(value("kintrel_post_seconds_count ") >= 3 && value("kintrel_promotions_total ") >= 1, "{text}");
+    assert!(value("kintrel_merges_total{tier=\"fast\"} ") >= 1, "{text}");
+    assert_eq!(value("kintrel_sessions "), 3);
+    let state = kintrel_core::state::State::open_with_log(&kintrel_core::board::state_db(&repo), &kintrel_core::board::log_db(&repo)).unwrap();
+    let (_, id) = state.lookup(st.head.unwrap(), "img/logo.png").unwrap().expect("in head");
+    assert_eq!(state.get_blob(id).unwrap().unwrap(), png);
+    // The log names who wrote what, newest first, and what became of it.
+    let mine = state.log(Some("binary"), 10).unwrap();
+    assert_eq!((mine.len(), mine[0].paths.clone(), mine[0].state), (1, vec!["img/logo.png".to_string()], "promoted"), "{mine:?}");
+    let all = state.log(None, 2).unwrap();
+    assert!(all.len() == 2 && all[0].gseq > all[1].gseq && all[0].author == "binary", "{all:?}");
+    let bad = FileWrite { path: "x.bin".into(), content: None, base: None, binary: Some("zz".into()) };
+    let r: Result<Posted, _> = c.call(proto::POST, &Post { token, files: vec![bad], summary: None }).await;
+    assert!(r.is_err());
     std::fs::remove_dir_all(kintrel_core::board::runtime_dir(&repo).unwrap()).ok();
     std::fs::remove_dir_all(&repo).ok();
 }

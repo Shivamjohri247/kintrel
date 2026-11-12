@@ -89,6 +89,12 @@ impl CiWorker {
     }
 
     /// Approves changing the config from `trusted` (the promoted one) to `theirs`.
+    /// Check runs queued or running (a gate candidate, head feedback) and deploys waiting.
+    pub fn pending(&self) -> u64 {
+        let w = self.want.lock().unwrap();
+        w.gate.is_some() as u64 + w.feedback.is_some() as u64 + w.promoted.len() as u64
+    }
+
     pub fn approve_config(&self, trusted: Option<Hash>, theirs: Option<Hash>) {
         let mut w = self.want.lock().unwrap();
         w.approved.insert((trusted, theirs));
@@ -202,7 +208,7 @@ impl CiWorker {
             Ok(Some((n.session, *note, failing)))
         };
         run().unwrap_or_else(|e| {
-            eprintln!("kintrel ci: bisection failed: {e}");
+            tracing::error!("bisection failed: {e}");
             None
         })
     }
@@ -218,7 +224,7 @@ impl CiWorker {
             if !failed.is_empty()
                 && let Some(report) = self.report.get()
             {
-                eprintln!("kintrel ci: deploy failed on {}", root.short());
+                tracing::warn!("deploy failed on {}", root.short());
                 report(failed);
             }
             let due = {
@@ -242,7 +248,7 @@ impl CiWorker {
             Ok(())
         };
         if let Err(e) = run() {
-            eprintln!("kintrel ci: after promotion: {e}");
+            tracing::error!("after promotion: {e}");
         }
     }
 
@@ -250,7 +256,7 @@ impl CiWorker {
     fn tiers(&self, root: Hash, keep: &dyn Fn(&kintrel_ci::Check) -> bool) {
         let r = self.reader().and_then(|st| promoted_config(&st)).and_then(|config| self.checks(root, config, keep, false));
         if let Err(e) = r {
-            eprintln!("kintrel ci: {e}");
+            tracing::error!("{e}");
         }
     }
 
@@ -296,6 +302,8 @@ impl CiWorker {
 
 fn decide(outcomes: &[Outcome]) -> GateState {
     let mut failing: Vec<String> = outcomes.iter().filter(|o| !o.ok).map(|o| o.check.clone()).collect();
+    let counter = if failing.is_empty() { &kintrel_core::metrics::GATE_PASSES } else { &kintrel_core::metrics::GATE_FAILS };
+    counter.add(1);
     failing.sort();
     failing.dedup();
     if failing.is_empty() { GateState::Pass } else { GateState::Fail(failing) }

@@ -514,7 +514,6 @@ fn backend(cmd: &str, dir: Option<&Path>, policy: &Policy, writable: &[PathBuf],
 
 #[cfg(target_os = "linux")]
 fn backend(cmd: &str, dir: Option<&Path>, policy: &Policy, writable: &[PathBuf], secrets: &[PathBuf]) -> Result<Command, String> {
-    // ponytail: written against bubblewrap's documented flags; not run on this macOS dev machine.
     let bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
         .iter()
         .map(Path::new)
@@ -557,7 +556,6 @@ fn backend(_cmd: &str, _dir: Option<&Path>, _policy: &Policy, _writable: &[PathB
 
 /// Windows: the check runs in the AppContainer `kintrel.checks`, inside a job object that
 /// kills its whole process tree when the wait ends.
-// ponytail: compile-checked from macOS, not yet run on Windows (no Windows machine here).
 #[cfg(windows)]
 mod appcontainer {
     use super::{AgentPolicy, Policy, Running};

@@ -47,7 +47,7 @@ async fn git_commits_merge_with_agents_work() {
     let agent: SessionStarted = c.call(proto::SESSION_START, &SessionStart { agent: "a".into(), rank_hint: None, base: None }).await.unwrap();
     let mut head_a = BASE.to_owned();
     let post = async |c: &mut Client, text: String| {
-        let files = vec![FileWrite { path: "a.py".into(), content: Some(text), base: None }];
+        let files = vec![FileWrite { path: "a.py".into(), content: Some(text), base: None, binary: None }];
         let _: Posted = c.call(proto::POST, &Post { token: agent.token.clone(), files, summary: None }).await.unwrap();
     };
     let head = async |c: &mut Client| {

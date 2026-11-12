@@ -125,7 +125,7 @@ pub async fn run(opts: Options) -> io::Result<()> {
             if tried.insert(conflict.id())
                 && let Err(e) = proposer.tier3(session, &conflict, &mut token).await
             {
-                eprintln!("kintrel tier3: {}: {}", conflict.atom, e.message);
+                tracing::warn!("tier3: {}: {}", conflict.atom, e.message);
             }
         }
     });
@@ -188,6 +188,8 @@ struct Session {
     overlay: HashMap<String, Option<(Kind, Hash)>>,
     /// Atoms read since the previous note (SPEC §8.2).
     reads: BTreeMap<AtomKey, Hash>,
+    /// The current one-second window and the posts in it (`MAX_POSTS_PER_SEC`).
+    posts: (std::time::Instant, u32),
 }
 
 struct Board {
@@ -231,7 +233,19 @@ struct Prepared {
 }
 
 impl Board {
+    /// Runs one request, in a span named after its method (`KINTREL_LOG=kintrel=debug`).
     async fn dispatch(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        use tracing::Instrument;
+        let started = std::time::Instant::now();
+        let r = self.dispatch_method(method, params).instrument(tracing::debug_span!("rpc", method)).await;
+        match &r {
+            Ok(_) => tracing::debug!(method, us = started.elapsed().as_micros() as u64, "ok"),
+            Err(e) => tracing::info!(method, code = e.code, "failed: {}", e.message),
+        }
+        r
+    }
+
+    async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {
             proto::SESSION_START => reply(self.session_start(parse(params)?).await),
             proto::SESSION_REFRESH => reply(self.refresh(parse(params)?).await),
@@ -248,6 +262,7 @@ impl Board {
             proto::REVERT => reply(self.revert(parse(params)?).await),
             proto::CHECKS_RUN => reply(self.checks(parse(params)?).await),
             proto::SYNC => reply(self.sync(parse(params)?).await),
+            proto::METRICS => reply(Ok(self.metrics())),
             _ => Err(RpcError::new(code::METHOD_NOT_FOUND, format!("unknown method {method:?}"))),
         }
     }
@@ -288,6 +303,7 @@ impl Board {
             base_parents,
             last_gseq: 0,
             since_refresh: vec![],
+            posts: (std::time::Instant::now(), 0),
             overlay: HashMap::new(),
             reads: BTreeMap::new(),
         };
@@ -345,7 +361,11 @@ impl Board {
     /// Posts a note of `kind`. Only the daemon itself posts `Resolution` notes (Tier 3): a client
     /// could otherwise mark any conflict resolved.
     async fn post_as(&self, p: proto::Post, kind: NoteKind) -> Result<proto::Posted, RpcError> {
-        let files = p.files.into_iter().map(|f| (f.path, f.content.map(String::into_bytes), f.base)).collect();
+        let mut files = Vec::with_capacity(p.files.len());
+        for f in p.files {
+            let bytes = f.new_bytes().map_err(|e| RpcError::new(code::INVALID_PARAMS, e))?;
+            files.push((f.path, bytes, f.base));
+        }
         self.post_files(&p.token, files, kind, HashMap::new()).await
     }
 
@@ -360,6 +380,7 @@ impl Board {
         note_kind: NoteKind,
         from_git: HashMap<String, (Option<ViewFile>, Kind)>,
     ) -> Result<proto::Posted, RpcError> {
+        let started = std::time::Instant::now();
         let invalid = |m: String| RpcError::new(code::INVALID_PARAMS, m);
         if files.is_empty() || files.len() > MAX_OPS {
             return Err(invalid(format!("a note must write 1..={MAX_OPS} files")));
@@ -380,6 +401,10 @@ impl Board {
 
         let session = self.session(token)?;
         let mut s = session.lock().await;
+        if let Err(wait_ms) = allow_post(&mut s.posts, std::time::Instant::now()) {
+            kintrel_core::metrics::POSTS_BUSY.add(1);
+            return Err(RpcError::busy(wait_ms));
+        }
         let (root, overlay) = (s.base_root, s.overlay.clone());
         // The view must stay a valid tree: a written file may not be a parent of another file,
         // or have one as a parent, among this post and the session's own writes. (Parents in
@@ -494,7 +519,10 @@ impl Board {
             })
             .await
             .map_err(|e| match e {
-                AppendError::Busy => RpcError::busy(1),
+                AppendError::Busy => {
+                    kintrel_core::metrics::POSTS_BUSY.add(1);
+                    RpcError::busy(1)
+                }
                 e => RpcError::new(code::INTERNAL, e.to_string()),
             })?;
 
@@ -518,6 +546,7 @@ impl Board {
                 Op::Delete { path, .. } => s.overlay.insert(path, None),
             };
         }
+        kintrel_core::metrics::observe_post(started.elapsed().as_micros() as u64);
         Ok(proto::Posted { note_id, gseq, atoms })
     }
 
@@ -649,7 +678,7 @@ impl Board {
                 .map(String::from_utf8)
                 .transpose()
                 .map_err(|_| RpcError::new(code::INVALID_PARAMS, format!("{path:?} is not UTF-8 text")))?;
-            writes.push(proto::FileWrite { path, content, base: None });
+            writes.push(proto::FileWrite { path, content, base: None, binary: None });
         }
         self.post(proto::Post { token: p.token, files: writes, summary: Some(format!("revert {}", p.note)) }).await
     }
@@ -759,7 +788,7 @@ impl Board {
             .post_as(
                 proto::Post {
                     token,
-                    files: vec![proto::FileWrite { path, content: Some(merged), base: Some(ours.hash) }],
+                    files: vec![proto::FileWrite { path, content: Some(merged), base: Some(ours.hash), binary: None }],
                     summary: Some(format!("Tier 3 merge for conflict {}", conflict.id().short())),
                 },
                 NoteKind::Resolution { conflict: conflict.id() },
@@ -915,6 +944,23 @@ impl Board {
         }
     }
 
+    /// Prometheus text: the process-wide counters, and the status figures as gauges.
+    fn metrics(&self) -> String {
+        let s = self.status();
+        let passes = self.heads.lock().unwrap().passes;
+        kintrel_core::metrics::render(&[
+            ("sessions", "Live sessions.", s.sessions),
+            ("notes", "Notes in the log.", s.notes),
+            ("combiner_lag_notes", "Notes logged but not yet folded into head.", s.notes.saturating_sub(s.folded)),
+            ("unpromoted_notes", "Notes in head not yet promoted.", s.unpromoted),
+            ("promotion_wait_ms", "How long promotion has waited for them.", s.promotion_wait_ms),
+            ("conflicts_open", "Open conflicts.", s.conflicts),
+            ("ci_pending", "Check runs queued or running, and deploys waiting.", s.ci_pending),
+            ("combiner_passes", "Combiner passes so far.", passes),
+            ("combiner_last_pass_ms", "Duration of the latest combiner pass.", s.pass_ms),
+        ])
+    }
+
     fn status(&self) -> proto::StatusInfo {
         let h = self.heads.lock().unwrap().clone();
         proto::StatusInfo {
@@ -924,6 +970,12 @@ impl Board {
             promoted: Some(h.promoted),
             conflicts: h.conflicts,
             folded: h.folded,
+            unpromoted: h.folded.saturating_sub(h.promoted_gseq),
+            promotion_wait_ms: match h.folded > h.promoted_gseq && h.promoted_ms > 0 {
+                true => (SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64).saturating_sub(h.promoted_ms),
+                false => 0,
+            },
+            ci_pending: self.worker.pending(),
             pass_ms: h.pass_ms,
             blocked: h.blocked,
             failing: h.failing,
@@ -1014,6 +1066,18 @@ fn prepare(
     Ok(Prepared { path, current, content, base, blocked, atoms, changes })
 }
 
+/// Counts a post against its session's one-second window; `Err` is how long to wait.
+fn allow_post(window: &mut (std::time::Instant, u32), now: std::time::Instant) -> Result<(), u64> {
+    let elapsed = now.duration_since(window.0);
+    if elapsed >= std::time::Duration::from_secs(1) {
+        *window = (now, 0);
+    } else if window.1 >= proto::MAX_POSTS_PER_SEC {
+        return Err(1000 - elapsed.as_millis() as u64);
+    }
+    window.1 += 1;
+    Ok(())
+}
+
 /// `parent` is a strict ancestor directory of `path`.
 fn is_parent(parent: &str, path: &str) -> bool {
     path.len() > parent.len() && path.starts_with(parent) && path.as_bytes()[parent.len()] == b'/'
@@ -1025,4 +1089,22 @@ fn parse<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
 
 fn reply<T: Serialize>(r: Result<T, RpcError>) -> Result<Value, RpcError> {
     r.map(|v| serde_json::to_value(v).expect("results always serialize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn posts_are_limited_per_second() {
+        let start = Instant::now();
+        let mut window = (start, 0);
+        for _ in 0..kintrel_core::proto::MAX_POSTS_PER_SEC {
+            assert!(super::allow_post(&mut window, start).is_ok());
+        }
+        let wait = super::allow_post(&mut window, start + Duration::from_millis(400)).unwrap_err();
+        assert_eq!(wait, 600, "the rest of the second");
+        assert!(super::allow_post(&mut window, start + Duration::from_secs(1)).is_ok(), "a new window");
+        assert_eq!(window.1, 1);
+    }
 }

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 kintrel-core.workspace = true
 kintrel-lang.workspace = true
 globset.workspace = true

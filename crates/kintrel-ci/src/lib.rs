@@ -302,6 +302,10 @@ impl Ci {
             .prepare_cached("SELECT ok, output, ms FROM results WHERE key = ?1")?
             .query_row([&job.key.0[..]], |r| Ok((r.get::<_, bool>(0)?, r.get::<_, String>(1)?, r.get::<_, u64>(2)?)))
             .optional()?;
+        if row.is_some() {
+            kintrel_core::metrics::CHECKS_RUN.add(1);
+            kintrel_core::metrics::CHECKS_CACHED.add(1);
+        }
         Ok(row.map(|(ok, output, ms)| Outcome {
             check: job.check.name.clone(),
             tier: job.check.tier,
@@ -527,6 +531,16 @@ fn quote(s: &str) -> std::result::Result<String, String> {
 }
 
 fn execute(job: &Job, dir: &Path, repo: &Path) -> Outcome {
+    let o = execute_uncounted(job, dir, repo);
+    kintrel_core::metrics::CHECKS_RUN.add(1);
+    kintrel_core::metrics::CHECK_MS.add(o.ms);
+    if !o.ok {
+        kintrel_core::metrics::CHECKS_FAILED.add(1);
+    }
+    o
+}
+
+fn execute_uncounted(job: &Job, dir: &Path, repo: &Path) -> Outcome {
     let package_dir = if job.target.is_empty() { "." } else { &job.target };
     let root = dir.to_string_lossy();
     let cmd = expand(&job.check.run, &[("file", &job.target), ("package_dir", package_dir), ("package", &job.package), ("root", &root)]);
