@@ -114,3 +114,7 @@ kintrel export                # commit the promoted root to kintrel/main, naming
 
 `kintrel sync` merges each new commit into head like an agent's edit; a commit that conflicts with agents' work is reported, and `kintrel conflicts` shows it. Merging `kintrel/main` back into your branch is safe to sync: only what you added comes in.
 
+## License
+
+Apache License 2.0; see [`LICENSE`](LICENSE).
+
