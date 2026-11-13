@@ -38,7 +38,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: kintrel-*.*
+          path: |
+            kintrel-*.tar.gz
+            kintrel-*.zip
 
   release:
     needs: build
@@ -47,7 +49,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - run: sha256sum kintrel-* > SHA256SUMS
+      - run: sha256sum kintrel-*.tar.gz kintrel-*.zip > SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" kintrel-* SHA256SUMS --repo "$GITHUB_REPOSITORY" --title "Kintrel $GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" kintrel-*.tar.gz kintrel-*.zip SHA256SUMS --repo "$GITHUB_REPOSITORY" --title "Kintrel $GITHUB_REF_NAME" --generate-notes
