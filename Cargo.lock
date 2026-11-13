@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "kintrel"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "kintrel-ci"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "globset",
  "kintrel-core",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "kintrel-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "diffy",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "kintrel-lang"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "tree-sitter",
