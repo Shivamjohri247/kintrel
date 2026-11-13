@@ -134,7 +134,7 @@ pub fn export(st: &State, git_dir: &Path, root: Hash, branch: &str) -> anyhow::R
         let upto = st.get_mark(kintrel_core::state::PROMOTED_GSEQ)?;
         let after = parent
             .as_ref()
-            .and_then(|p| p.message_raw().ok().map(|m| m.to_string()))
+            .and_then(|p| p.message_raw().ok().map(ToString::to_string))
             .and_then(|m| m.lines().find_map(|l| l.strip_prefix("Kintrel-Gseq: ").and_then(|n| n.trim().parse().ok())))
             .unwrap_or(0);
         message.push_str(&format!("Kintrel-Gseq: {upto}\n"));
@@ -256,6 +256,7 @@ pub fn pending(git_dir: &Path, branch: &str, since: Option<&str>) -> anyhow::Res
             e.map(|(k, id)| Ok((*k, repo.find_object(*id)?.data.clone()))).transpose()
         };
         let mut changes = vec![];
+        // A set: a path in both trees is one change.
         for path in before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>() {
             let (b, a) = (before.get(path), after.get(path));
             if b != a {

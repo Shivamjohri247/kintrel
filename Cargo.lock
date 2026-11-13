@@ -1595,7 +1595,6 @@ dependencies = [
  "kintrel-ci",
  "kintrel-core",
  "kintrel-lang",
- "reflink-copy",
  "rmcp",
  "rusqlite",
  "serde",
@@ -1619,7 +1618,6 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
- "tracing",
 ]
 
 [[package]]

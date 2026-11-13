@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use kintrel::daemon::{self, Options};
 use kintrel::rpc::Client;
 use kintrel_core::log::Durability;
-use kintrel_core::proto::{self, FileContent, FileWrite, Inbox, Notices, Post, Posted, ReadFile, SessionStart, SessionStarted, StatusInfo};
+use kintrel_core::proto::{self, FileContent, FileWrite, Inbox, NoticeKind, Notices, Post, Posted, ReadFile, SessionStart, SessionStarted, StatusInfo};
 
 const A: &str = "def fee():\n    return 1\n";
 
@@ -61,7 +61,7 @@ async fn a_conflict_gets_a_proposal_that_resolves_it() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let n: Notices = e.call(proto::INBOX, &Inbox { token: te.clone() }).await.unwrap();
-    assert!(n.notices.iter().any(|n| n.kind == "merge_proposed"), "{:?}", n.notices);
+    assert!(n.notices.iter().any(|n| n.kind == NoticeKind::MergeProposed), "{:?}", n.notices);
     std::fs::remove_file(&model).ok();
     std::fs::remove_dir_all(kintrel_core::board::runtime_dir(&repo).unwrap()).ok();
     std::fs::remove_dir_all(&repo).ok();

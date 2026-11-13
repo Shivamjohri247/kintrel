@@ -68,6 +68,13 @@ pub struct AtomSpan {
     pub sig: Option<Range<u32>>,
 }
 
+impl AtomSpan {
+    /// The 1-based line the atom starts on in `bytes`.
+    pub fn line(&self, bytes: &[u8]) -> usize {
+        self.ranges.first().map_or(1, |r| 1 + bytes[..r.start as usize].iter().filter(|&&b| b == b'\n').count())
+    }
+}
+
 impl Segmented {
     /// Every atom of the file, file-level atom first, then in source order.
     pub fn atoms(&self) -> Vec<AtomSpan> {

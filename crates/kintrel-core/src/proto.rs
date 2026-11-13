@@ -277,8 +277,7 @@ pub struct Notices {
 /// One notice (SPEC §8.3): small and machine-generated. Empty fields are left out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notice {
-    /// `body_changed`, `interface_changed`, `deleted`, `conflict` or `many_changes`.
-    pub kind: String,
+    pub kind: NoticeKind,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub atom: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +308,30 @@ pub struct Notice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub atoms: Vec<String>,
     pub action: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    #[default]
+    BodyChanged,
+    InterfaceChanged,
+    Deleted,
+    Conflict,
+    ManyChanges,
+    ClaimOverlap,
+    Intent,
+    CiFailed,
+    Rejected,
+    MergeProposed,
+    Incident,
+}
+
+impl NoticeKind {
+    /// A change to an atom someone uses; unread ones about the same atom coalesce (SPEC §8.4).
+    pub fn is_change(self) -> bool {
+        matches!(self, Self::BodyChanged | Self::InterfaceChanged | Self::Deleted)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,11 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kintrel_core::combine::{Combiner, Heads, diff_atoms};
-use kintrel_core::merge::merge3;
 use kintrel_core::note::{AtomKey, AtomRead, Note, NoteKind, Op, atom_hashes};
 use kintrel_core::state::{self, State};
 use kintrel_core::tree::Kind;
-use kintrel_core::{Hash, blob, board, encode};
+use kintrel_core::{Hash, board, encode};
 use kintrel_core::log::{AppendError, Durability, LogWriter, NewBlob, NewNote};
 use kintrel_core::path::is_safe_rel_path;
 use kintrel_core::proto::{self, MAX_BLOB, MAX_OPS, MAX_SUMMARY, Request, Response, RpcError, code};
@@ -24,8 +23,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::notices::{self, Coord, Interest};
+use crate::notices::{self, Coord};
 use crate::rpc::{read_frame, write_frame};
+
+mod checks;
+mod revert;
+mod sync;
+mod tier3;
 
 pub struct Options {
     pub repo: PathBuf,
@@ -56,7 +60,7 @@ fn person_key(repo: &Path) -> io::Result<String> {
     }
 }
 
-const TIER3_AGENT: &str = "kintrel-tier3";
+pub(crate) const TIER3_AGENT: &str = "kintrel-tier3";
 /// Agent names only the daemon uses: notes under them are Kintrel's own (sync, Tier 3).
 const RESERVED_AGENTS: &[&str] = &[crate::git::SYNC_AGENT, TIER3_AGENT];
 
@@ -80,7 +84,7 @@ pub async fn run(opts: Options) -> io::Result<()> {
     let reader = open_reader(&opts.repo).map_err(io::Error::other)?;
     // Open the pool up front: opening a connection mid-request costs milliseconds.
     let mut readers = vec![];
-    for _ in 1..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+    for _ in 1..std::thread::available_parallelism().map_or(4, std::num::NonZero::get) {
         readers.push(open_reader(&opts.repo).map_err(io::Error::other)?);
     }
     let head = reader.get_ref(state::HEAD).map_err(io::Error::other)?.ok_or_else(not_board)?;
@@ -88,12 +92,12 @@ pub async fn run(opts: Options) -> io::Result<()> {
     let first_session = reader.max_session().map_err(io::Error::other)? + 1;
     readers.push(reader);
 
-    let heads = Arc::new(Mutex::new(Heads { head, promoted, ..Heads::default() }));
+    let (publish, heads) = tokio::sync::watch::channel(Heads { head, promoted, ..Heads::default() });
     let (events, inbound) = std::sync::mpsc::channel();
     let ci = Arc::new(kintrel_ci::Ci::open(&opts.repo).map_err(io::Error::other)?);
     let worker = crate::ci_worker::CiWorker::start(opts.repo.clone(), ci.clone())?;
     let gate: Arc<dyn kintrel_core::combine::Gate> = worker.clone();
-    let combiner = Combiner::spawn(&opts.repo, heads.clone(), opts.promote_every, Some(events), Some(gate)).map_err(io::Error::other)?;
+    let combiner = Combiner::spawn(&opts.repo, publish, opts.promote_every, Some(events), Some(gate)).map_err(io::Error::other)?;
     let _ = worker.wake_combiner.set(Box::new(combiner.waker()));
     let board = Arc::new(Board {
         repo: opts.repo,
@@ -138,9 +142,9 @@ pub async fn run(opts: Options) -> io::Result<()> {
                     let _ = conflicts.send((*session, conflict.clone()));
                 }
             }
-            notices::route(&mut router.coord.lock().unwrap(), events);
+            router.coord.lock().unwrap().route(events);
             if applied {
-                worker.feedback(router.heads.lock().unwrap().head);
+                worker.feedback(router.heads.borrow().head);
             }
         }
     })?;
@@ -197,7 +201,7 @@ struct Board {
     /// Idle read connections (state.db with log.db attached); `with_reader` opens more on demand.
     readers: Mutex<Vec<State>>,
     /// Published by the combiner after each pass.
-    heads: Arc<Mutex<Heads>>,
+    heads: tokio::sync::watch::Receiver<Heads>,
     combiner: Combiner,
     log: LogWriter,
     // A per-session async lock serializes one session's reads and posts, keeping `seq` gapless.
@@ -292,7 +296,7 @@ impl Board {
         seed.extend_from_slice(&id.to_le_bytes());
         // ponytail: derived token, fine behind the 0600 socket; signed identities arrive with server mode (§13).
         let token = Hash::of(&seed).to_string();
-        let (base_root, base_parents) = self.with_reader(|st| st.head_and_frontier()).await?;
+        let (base_root, base_parents) = self.with_reader(State::head_and_frontier).await?;
         let session = Session {
             id,
             agent: agent.clone(),
@@ -458,7 +462,7 @@ impl Board {
                 (None, None) => return Err(invalid(format!("cannot delete {:?}: no such file", f.path))),
                 (Some(c), None) => {
                     if kinds.contains_key(&f.path) {
-                        blobs.push(NewBlob { id: c.id, len: c.bytes.len() as u64, zstd: blob::compress(&c.bytes) });
+                        blobs.push(NewBlob::of(&c.bytes));
                     }
                     ops.push(Op::Delete { path: f.path, base: c.id })
                 }
@@ -470,9 +474,9 @@ impl Board {
                     }
                     if let Some(c) = cur.as_ref().filter(|_| kinds.contains_key(&f.path)) {
                         // A commit's base may be a version the board never stored.
-                        blobs.push(NewBlob { id: c.id, len: c.bytes.len() as u64, zstd: blob::compress(&c.bytes) });
+                        blobs.push(NewBlob::of(&c.bytes));
                     }
-                    blobs.push(NewBlob { id, len: new.len() as u64, zstd: blob::compress(&new) });
+                    blobs.push(NewBlob::of(&new));
                     ops.push(Op::Write { path: f.path, base: cur.map(|c| c.id), content: id, kind });
                 }
             }
@@ -556,16 +560,8 @@ impl Board {
         self.coord.lock().unwrap().touch(s.id);
         // Wait for a combiner pass that includes this session's last note (gseq is gapless and
         // every logged note is folded, so `folded` counts notes up to that gseq).
-        let start = std::time::Instant::now();
-        loop {
-            if self.heads.lock().unwrap().folded >= s.last_gseq {
-                break;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(10) {
-                return Err(RpcError::new(code::INTERNAL, "the combiner is not keeping up; try again"));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        let gseq = s.last_gseq;
+        self.wait_heads(std::time::Duration::from_secs(10), |h| h.folded >= gseq).await?;
         let notes = s.since_refresh.clone();
         let (head, frontier, lost) = self
             .with_reader(move |st| {
@@ -591,8 +587,7 @@ impl Board {
         let id = self.session(&p.token)?.lock().await.id;
         let mut coord = self.coord.lock().unwrap();
         coord.touch(id);
-        let notices = coord.sessions.get_mut(&id).map(Interest::take).unwrap_or_default();
-        Ok(proto::Notices { notices })
+        Ok(proto::Notices { notices: coord.take_inbox(id) })
     }
 
     async fn announce(&self, p: proto::Announce, intent: bool) -> Result<proto::Announced, RpcError> {
@@ -629,231 +624,6 @@ impl Board {
         }
     }
 
-    /// Reverts a note as a three-way merge per file: base = the note's result, ours = the view,
-    /// theirs = the note's base. Only the note's own atoms go back; later work stays.
-    async fn revert(&self, p: proto::Revert) -> Result<proto::Posted, RpcError> {
-        let (root, overlay) = {
-            let s = self.session(&p.token)?;
-            let s = s.lock().await;
-            (s.base_root, s.overlay.clone())
-        };
-        let prefix = p.note.clone();
-        let files = self
-            .with_reader(move |st| {
-                let Some((_, note)) = st.find_note(&prefix)? else { return Ok(Err(format!("no single note matches {prefix:?}"))) };
-                let blob = |id: Option<Hash>| -> kintrel_core::Result<Option<Vec<u8>>> {
-                    id.map(|id| st.get_blob(id)?.ok_or_else(|| kintrel_core::Error::Corrupt(format!("missing blob {id}")))).transpose()
-                };
-                let mut out = vec![];
-                let mut stuck = vec![];
-                for op in &note.ops {
-                    let (before, after) = match op {
-                        Op::Write { base, content, .. } => (blob(*base)?, blob(Some(*content))?),
-                        Op::Delete { base, .. } => (blob(Some(*base))?, None),
-                    };
-                    let view = view_file(st, root, overlay.get(op.path()).cloned(), op.path())?.map(|f| f.bytes);
-                    match merge3(op.path(), after.as_deref(), view.as_deref(), before.as_deref()) {
-                        Ok(r) if r == view => {}
-                        Ok(r) => out.push((op.path().to_owned(), r)),
-                        Err(atoms) => stuck.extend(atoms.into_iter().map(|a| a.to_string())),
-                    }
-                }
-                Ok(if stuck.is_empty() { Ok(out) } else { Err(stuck.join(", ")) })
-            })
-            .await?;
-        let files = match files {
-            Ok(f) if f.is_empty() => return Err(RpcError::new(code::INVALID_PARAMS, "nothing to revert: your view already lacks that note's changes")),
-            Ok(f) => f,
-            Err(why) if why.starts_with("no single note") => return Err(RpcError::new(code::NOT_FOUND, why)),
-            Err(atoms) => {
-                return Err(RpcError {
-                    data: Some(serde_json::json!({ "atoms": atoms.split(", ").collect::<Vec<_>>() })),
-                    ..RpcError::new(code::CONFLICT, format!("cannot revert cleanly: {atoms} changed since"))
-                });
-            }
-        };
-        let mut writes = vec![];
-        for (path, content) in files {
-            let content = content
-                .map(String::from_utf8)
-                .transpose()
-                .map_err(|_| RpcError::new(code::INVALID_PARAMS, format!("{path:?} is not UTF-8 text")))?;
-            writes.push(proto::FileWrite { path, content, base: None, binary: None });
-        }
-        self.post(proto::Post { token: p.token, files: writes, summary: Some(format!("revert {}", p.note)) }).await
-    }
-
-    /// Runs checks on a session's view (its base plus its own writes), a root, or head.
-    async fn checks(&self, p: proto::ChecksRun) -> Result<proto::ChecksRan, RpcError> {
-        let tier = match p.tier.as_deref() {
-            None => None,
-            Some("lint") => Some(kintrel_ci::Tier::Lint),
-            Some("typecheck") => Some(kintrel_ci::Tier::Typecheck),
-            Some("test") => Some(kintrel_ci::Tier::Test),
-            Some(t) => return Err(RpcError::new(code::INVALID_PARAMS, format!("unknown tier {t:?}"))),
-        };
-        let snap = match (&p.token, p.at) {
-            (Some(token), _) => {
-                let s = self.session(token)?;
-                let s = s.lock().await;
-                self.coord.lock().unwrap().touch(s.id);
-                kintrel_ci::Snapshot { root: s.base_root, overlay: s.overlay.clone().into_iter().collect(), ..Default::default() }
-            }
-            (None, Some(root)) => kintrel_ci::Snapshot { root, ..Default::default() },
-            (None, None) => kintrel_ci::Snapshot { root: self.heads.lock().unwrap().head, ..Default::default() },
-        };
-        let (ci, repo, root) = (self.ci.clone(), self.repo.clone(), snap.root);
-        let promoted = self.heads.lock().unwrap().promoted;
-        let outcomes = tokio::task::spawn_blocking(move || -> Result<Vec<kintrel_ci::Outcome>, String> {
-            let st = open_reader(&repo).map_err(|e| e.to_string())?;
-            // The promoted config, never the snapshot's own (see ci_worker).
-            let config = kintrel_ci::config_of(&st, promoted).map_err(|e| e.to_string())?;
-            ci.run(&st, &repo, config, &snap, tier).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| RpcError::new(code::INTERNAL, e.to_string()))?
-        .map_err(|e| RpcError::new(code::INVALID_PARAMS, e))?;
-        let outcomes = outcomes
-            .into_iter()
-            .map(|o| proto::CheckOutcome {
-                check: o.check,
-                tier: format!("{:?}", o.tier).to_lowercase(),
-                target: o.target,
-                ok: o.ok,
-                cached: o.cached,
-                timed_out: o.timed_out,
-                ms: o.ms,
-                output: o.output,
-                key: o.key,
-            })
-            .collect();
-        Ok(proto::ChecksRan { root, outcomes })
-    }
-
-    /// Tier 3 (SPEC §7.3): asks Claude to merge a conflicting note into current head, and posts
-    /// the validated result as a `Resolution` note from the `kintrel-tier3` session, where the
-    /// gate judges it like any note. Only when the trusted (promoted) kintrel.toml enables it.
-    async fn tier3(&self, losing_session: u64, conflict: &kintrel_core::combine::Conflict, token: &mut Option<String>) -> Result<(), RpcError> {
-        let internal = |m: String| RpcError::new(code::INTERNAL, m);
-        let promoted = self.heads.lock().unwrap().promoted;
-        let settings = self
-            .with_reader(move |st| {
-                let Some(id) = kintrel_ci::config_of(st, promoted).map_err(|e| kintrel_core::Error::Invalid(e.to_string()))? else { return Ok(None) };
-                let text = st.get_blob(id)?.unwrap_or_default();
-                Ok(kintrel_ci::Config::parse(&String::from_utf8_lossy(&text)).ok().map(|c| c.merge))
-            })
-            .await?;
-        let Some(settings) = settings.filter(|m| m.tier3) else { return Ok(()) };
-        if settings.tier3_command.is_none() && !kintrel_core::tier3::available() {
-            return Err(internal("no backend: set ANTHROPIC_API_KEY or install the claude CLI".into()));
-        }
-        let model = settings.tier3_model.unwrap_or_else(|| kintrel_core::tier3::DEFAULT_MODEL.into());
-        let command = settings.tier3_command;
-        if token.is_none() {
-            let started = self.open_session(TIER3_AGENT.into()).await?;
-            *token = Some(started.token);
-        }
-        let token = token.clone().expect("set above");
-        // Merge into the current head.
-        let _: proto::Refreshed = self.refresh(proto::Refresh { token: token.clone() }).await?;
-        let (path, losing) = (conflict.atom.path.clone(), conflict.losing.to_string());
-        let ours = self.read_file(proto::ReadFile { token: token.clone(), path: path.clone(), at: None }).await?;
-        let p = path.clone();
-        let sides = self
-            .with_reader(move |st| {
-                let Some((_, note)) = st.find_note(&losing)? else { return Ok(None) };
-                let blob = |id: Option<Hash>| -> kintrel_core::Result<Vec<u8>> {
-                    Ok(id.map(|id| st.get_blob(id)).transpose()?.flatten().unwrap_or_default())
-                };
-                Ok(match note.ops.iter().find(|op| op.path() == p) {
-                    Some(Op::Write { base, content, .. }) => Some((blob(*base)?, blob(Some(*content))?)),
-                    _ => None, // a deletion against an edit: nothing to merge textually
-                })
-            })
-            .await?;
-        let Some((base, theirs)) = sides else { return Ok(()) };
-        let ours_bytes = ours.content.clone().into_bytes();
-        let p = path.clone();
-        let merged = tokio::task::spawn_blocking(move || {
-            let merged = kintrel_core::tier3::propose_with(&p, &base, &ours_bytes, &theirs, &model, command.as_deref())?;
-            if !kintrel_core::merge::proposal_keeps_sides(&p, &base, &ours_bytes, &theirs, &merged) {
-                return Err("the proposal changed one-sided edits or does not parse".to_string());
-            }
-            String::from_utf8(merged).map_err(|_| "the proposal is not UTF-8".to_string())
-        })
-        .await
-        .map_err(|e| internal(e.to_string()))?
-        .map_err(internal)?;
-        let posted = self
-            .post_as(
-                proto::Post {
-                    token,
-                    files: vec![proto::FileWrite { path, content: Some(merged), base: Some(ours.hash), binary: None }],
-                    summary: Some(format!("Tier 3 merge for conflict {}", conflict.id().short())),
-                },
-                NoteKind::Resolution { conflict: conflict.id() },
-            )
-            .await?;
-        self.coord.lock().unwrap().merge_proposed(losing_session, &conflict.atom, posted.note_id);
-        Ok(())
-    }
-
-    /// Brings a Git branch's new commits into the board (SPEC §11): each one becomes notes from
-    /// its own `git` session, made against the commit's base, so the combiner merges it into head
-    /// and conflicts with agents' work are recorded like any other. The sync mark moves past
-    /// each commit once its notes are folded.
-    async fn sync(&self, p: proto::Sync) -> Result<proto::Synced, RpcError> {
-        let invalid = |e: anyhow::Error| RpcError::new(code::INVALID_PARAMS, format!("{e:#}"));
-        let internal = |e: &dyn std::fmt::Display| RpcError::new(code::INTERNAL, e.to_string());
-        let repo = self.repo.clone();
-        let (branch, commits) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let branch = match p.branch {
-                Some(b) => b,
-                None => crate::git::head_branch(&repo)?,
-            };
-            let commits = crate::git::pending(&repo, &branch, p.since.as_deref())?;
-            Ok((branch, commits))
-        })
-        .await
-        .map_err(|e| internal(&e))?
-        .map_err(invalid)?;
-        let mut synced = vec![];
-        for c in commits {
-            let started = self.open_session(crate::git::SYNC_AGENT.into()).await?;
-            let mut notes = vec![];
-            let mut result = Ok(());
-            for chunk in c.files.chunks(MAX_OPS) {
-                let mut from_git = HashMap::new();
-                let mut files = vec![];
-                for f in chunk {
-                    let base = f.base.as_ref().map(|(kind, bytes)| ViewFile { kind: *kind, id: Hash::of(bytes), bytes: bytes.clone() });
-                    from_git.insert(f.path.clone(), (base, f.new.as_ref().map_or(Kind::File, |(k, _)| *k)));
-                    files.push((f.path.clone(), f.new.as_ref().map(|(_, b)| b.clone()), None));
-                }
-                match self.post_files(&started.token, files, NoteKind::Code, from_git).await {
-                    Ok(posted) => notes.push(posted.note_id),
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
-            }
-            let lost = match result {
-                Ok(()) => self.refresh(proto::Refresh { token: started.token.clone() }).await.map(|r| r.lost),
-                Err(e) => Err(e),
-            };
-            self.end(proto::SessionRef { token: started.token }).await?;
-            let lost = lost.map_err(|e| RpcError::new(e.code, format!("commit {}: {}", c.id, e.message)))?;
-            let (repo, branch, id) = (self.repo.clone(), branch.clone(), c.id);
-            tokio::task::spawn_blocking(move || crate::git::set_sync_mark(&repo, &branch, id))
-                .await
-                .map_err(|e| internal(&e))?
-                .map_err(|e| internal(&format!("{e:#}")))?;
-            synced.push(proto::SyncedCommit { commit: c.id.to_string(), summary: c.summary, notes, lost });
-        }
-        Ok(proto::Synced { branch, commits: synced })
-    }
-
     async fn heartbeat(&self, p: proto::SessionRef) -> Result<proto::Status, RpcError> {
         let id = self.session(&p.token)?.lock().await.id;
         self.coord.lock().unwrap().touch(id);
@@ -869,16 +639,13 @@ impl Board {
     }
 
     /// Adds files to a session's footprint. For a file new to it, the session also gets
-    /// notices for what others changed there between its base and head ([`notices::catch_up`]).
+    /// notices for what others changed there between its base and head ([`Coord::catch_up`]).
     async fn interested(&self, session: u64, base: Hash, paths: impl IntoIterator<Item = String>) -> Result<(), RpcError> {
-        let new: Vec<String> = match self.coord.lock().unwrap().sessions.get_mut(&session) {
-            Some(int) => paths.into_iter().filter(|p| int.paths.insert(p.clone())).collect(),
-            None => return Ok(()),
-        };
+        let new = self.coord.lock().unwrap().add_paths(session, paths);
         if new.is_empty() {
             return Ok(());
         }
-        let head = self.heads.lock().unwrap().head;
+        let head = self.heads.borrow().head;
         let paths = new.clone();
         let changes = if head == base {
             vec![]
@@ -898,7 +665,7 @@ impl Board {
             })
             .await?
         };
-        notices::catch_up(&mut self.coord.lock().unwrap(), session, &paths, &changes);
+        self.coord.lock().unwrap().catch_up(session, &paths, &changes);
         Ok(())
     }
 
@@ -906,7 +673,7 @@ impl Board {
     async fn promote_now(&self, p: proto::PromoteNow) -> Result<proto::StatusInfo, RpcError> {
         if let Some(reviewed) = p.approve_config {
             let (head, promoted) = {
-                let h = self.heads.lock().unwrap();
+                let h = self.heads.borrow();
                 (h.head, h.promoted)
             };
             let (theirs, trusted) = self
@@ -927,27 +694,29 @@ impl Board {
             self.worker.approve_config(trusted, theirs);
         }
         let logged = self.log.last_gseq();
-        let asked = self.heads.lock().unwrap().passes;
+        let asked = self.heads.borrow().passes;
         self.combiner.promote_now();
-        let start = std::time::Instant::now();
-        loop {
-            let h = self.heads.lock().unwrap().clone();
-            // Only a pass that ran after this request answers it.
-            if h.passes > asked && h.folded >= logged && (h.promoted == h.head || !h.blocked.is_empty() || !h.failing.is_empty()) {
-                return Ok(self.status());
-            }
-            // Gate checks may take minutes (SPEC §10.5 timeouts bound them).
-            if start.elapsed() > std::time::Duration::from_secs(900) {
-                return Err(RpcError::new(code::INTERNAL, "the combiner is not keeping up; try again"));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Only a pass that ran after this request answers it. Gate checks may take minutes
+        // (SPEC §10.5 timeouts bound them).
+        self.wait_heads(std::time::Duration::from_secs(900), |h| {
+            h.passes > asked && h.folded >= logged && (h.promoted == h.head || !h.blocked.is_empty() || !h.failing.is_empty())
+        })
+        .await?;
+        Ok(self.status())
+    }
+
+    /// Waits up to `limit` for the combiner to publish heads that satisfy `done`.
+    async fn wait_heads(&self, limit: std::time::Duration, done: impl FnMut(&Heads) -> bool) -> Result<(), RpcError> {
+        match tokio::time::timeout(limit, self.heads.clone().wait_for(done)).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(RpcError::new(code::INTERNAL, "the combiner is not keeping up; try again")),
         }
     }
 
     /// Prometheus text: the process-wide counters, and the status figures as gauges.
     fn metrics(&self) -> String {
         let s = self.status();
-        let passes = self.heads.lock().unwrap().passes;
+        let passes = self.heads.borrow().passes;
         kintrel_core::metrics::render(&[
             ("sessions", "Live sessions.", s.sessions),
             ("notes", "Notes in the log.", s.notes),
@@ -962,7 +731,7 @@ impl Board {
     }
 
     fn status(&self) -> proto::StatusInfo {
-        let h = self.heads.lock().unwrap().clone();
+        let h = self.heads.borrow().clone();
         proto::StatusInfo {
             sessions: self.sessions.lock().unwrap().len() as u64,
             notes: self.log.last_gseq(),
@@ -972,7 +741,7 @@ impl Board {
             folded: h.folded,
             unpromoted: h.folded.saturating_sub(h.promoted_gseq),
             promotion_wait_ms: match h.folded > h.promoted_gseq && h.promoted_ms > 0 {
-                true => (SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64).saturating_sub(h.promoted_ms),
+                true => kintrel_core::now_ms().saturating_sub(h.promoted_ms),
                 false => 0,
             },
             ci_pending: self.worker.pending(),
@@ -1014,7 +783,7 @@ impl Board {
 }
 
 fn open_reader(repo: &Path) -> kintrel_core::Result<State> {
-    State::open_with_log(&board::state_db(repo), &board::log_db(repo))
+    State::open_board(repo)
 }
 
 /// The file at `path` in a view: the session's own write if it has one, else the base tree.
@@ -1029,7 +798,7 @@ fn view_file(
         None => st.lookup(root, path)?.filter(|(kind, _)| *kind != Kind::Dir),
     };
     let Some((kind, id)) = entry else { return Ok(None) };
-    let bytes = st.get_blob(id)?.ok_or_else(|| kintrel_core::Error::Corrupt(format!("missing blob {id}")))?;
+    let bytes = st.blob(id)?;
     Ok(Some(ViewFile { kind, id, bytes }))
 }
 

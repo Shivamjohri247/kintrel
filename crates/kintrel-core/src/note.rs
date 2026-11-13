@@ -51,6 +51,14 @@ impl Op {
             Op::Write { path, .. } | Op::Delete { path, .. } => path,
         }
     }
+
+    /// The file's content before and after the op (`None` = absent).
+    pub fn sides(&self) -> (Option<Hash>, Option<Hash>) {
+        match self {
+            Op::Write { base, content, .. } => (*base, Some(*content)),
+            Op::Delete { base, .. } => (Some(*base), None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

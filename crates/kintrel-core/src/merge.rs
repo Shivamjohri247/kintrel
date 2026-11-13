@@ -15,7 +15,7 @@
 //! A file that is unsupported or does not parse on any side merges as text. A structured
 //! merge whose result no longer parses is a conflict: merging never breaks parsing.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use kintrel_lang::{AtomKey, Item, Segment, Segmented, segment_checked};
 
@@ -131,7 +131,7 @@ pub fn proposal_keeps_sides(path: &str, base: &[u8], ours: &[u8], theirs: &[u8],
     if kintrel_lang::lang_for_path(path).is_none() || [base, ours, theirs, merged].iter().any(|v| segment_checked(path, v).is_none()) {
         return false;
     }
-    let index = |bytes: &[u8]| -> BTreeMap<AtomKey, crate::Hash> { crate::note::atom_hashes(path, bytes).into_iter().collect() };
+    let index = |bytes: &[u8]| atom_index(path, bytes);
     let (b, o, t, m) = (index(base), index(ours), index(theirs), index(merged));
     // Every atom, glue and container headers included: a one-sided change to any of them is kept.
     let keys: BTreeSet<&AtomKey> = b.keys().chain(o.keys()).chain(t.keys()).collect();
@@ -148,7 +148,7 @@ pub fn proposal_keeps_sides(path: &str, base: &[u8], ours: &[u8], theirs: &[u8],
 /// Every named leaf symbol that `side` changed (or added) is in `merged` exactly as `side` has
 /// it, and every one it deleted is gone. Glue and container headers may combine freely.
 fn keeps_changes(path: &str, base: &[u8], side: &[u8], merged: &[u8]) -> bool {
-    let index = |bytes: &[u8]| -> BTreeMap<AtomKey, crate::Hash> { crate::note::atom_hashes(path, bytes).into_iter().collect() };
+    let index = |bytes: &[u8]| atom_index(path, bytes);
     let (b, s, m) = (index(base), index(side), index(merged));
     let leaf = |k: &AtomKey, map: &BTreeMap<AtomKey, crate::Hash>| {
         !k.symbol.is_empty() && !map.keys().any(|o| o.symbol.len() > k.symbol.len() && o.symbol.starts_with(&k.symbol))
@@ -156,6 +156,10 @@ fn keeps_changes(path: &str, base: &[u8], side: &[u8], merged: &[u8]) -> bool {
     let changed_kept = s.iter().filter(|(k, h)| b.get(*k) != Some(*h) && leaf(k, &s)).all(|(k, h)| m.get(k) == Some(h));
     let deleted_gone = b.keys().filter(|k| !s.contains_key(*k) && leaf(k, &b)).all(|k| !m.contains_key(k));
     changed_kept && deleted_gone
+}
+
+fn atom_index(path: &str, bytes: &[u8]) -> BTreeMap<AtomKey, crate::Hash> {
+    crate::note::atom_hashes(path, bytes).into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -222,8 +226,9 @@ impl Level {
         }
     }
 
-    fn get(&self, seg: &Segment) -> Option<&Entry> {
-        self.items.iter().find(|e| &e.seg == seg)
+    /// Entries by segment: merging looks each one up several times per side.
+    fn index(&self) -> HashMap<&Segment, &Entry> {
+        self.items.iter().map(|e| (&e.seg, e)).collect()
     }
 
     fn keys(&self) -> Vec<&Segment> {
@@ -323,12 +328,13 @@ fn merge_level(b: &Level, o: &Level, t: &Level, owner: &[Segment], cx: &mut Cx) 
         p
     };
 
+    let (ib, io, it) = (b.index(), o.index(), t.index());
     // Atoms.
     let mut resolved: BTreeMap<Segment, Option<Node>> = BTreeMap::new();
     // Ordered, so conflicts come out the same way every time (determinism, SPEC §7.1).
     let all: BTreeSet<&Segment> = o.keys().into_iter().chain(t.keys()).collect();
     for seg in all {
-        let (bn, on, tn) = (b.get(seg).map(|e| &e.node), o.get(seg).map(|e| &e.node), t.get(seg).map(|e| &e.node));
+        let (bn, on, tn) = (ib.get(seg).map(|e| &e.node), io.get(seg).map(|e| &e.node), it.get(seg).map(|e| &e.node));
         let symbol = path_of(seg);
         let r = pick3(bn, on, tn, |bn, on, tn| merge_node(bn, on, tn, &symbol, cx));
         match r {
@@ -376,8 +382,8 @@ fn merge_level(b: &Level, o: &Level, t: &Level, owner: &[Segment], cx: &mut Cx) 
     });
     let mut items = Vec::with_capacity(order.len());
     for seg in order {
-        let g = |l: &Level| l.get(&seg).map(|e| e.gap.clone());
-        let (gb, go, gt) = (g(b), g(o), g(t));
+        let g = |l: &HashMap<&Segment, &Entry>| l.get(&seg).map(|e| e.gap.clone());
+        let (gb, go, gt) = (g(&ib), g(&io), g(&it));
         let gap = match pick3(gb.as_ref(), go.as_ref(), gt.as_ref(), |gb, go, gt| text3(gb.map_or(&[][..], |v| v), go, gt)) {
             Ok(gap) => gap.unwrap_or_default(),
             Err(()) => {
@@ -393,8 +399,8 @@ fn merge_level(b: &Level, o: &Level, t: &Level, owner: &[Segment], cx: &mut Cx) 
     // `if TYPE_CHECKING:  # pragma: no cover` dropped this way).
     let placed: HashSet<&Segment> = items.iter().map(|e| &e.seg).collect();
     for seg in b.keys().into_iter().chain(o.keys()).chain(t.keys()).filter(|s| !placed.contains(s)) {
-        let gb = b.get(seg).map(|e| &e.gap);
-        if [o.get(seg).map(|e| &e.gap), t.get(seg).map(|e| &e.gap)].into_iter().any(|side| side.is_some() && side != gb) {
+        let gb = ib.get(seg).map(|e| &e.gap);
+        if [io.get(seg).map(|e| &e.gap), it.get(seg).map(|e| &e.gap)].into_iter().any(|side| side.is_some() && side != gb) {
             owner_conflict = true;
         }
     }

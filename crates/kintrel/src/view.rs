@@ -43,7 +43,7 @@ pub struct Change {
 }
 
 fn open_store(repo: &Path) -> anyhow::Result<State> {
-    Ok(State::open_with_log(&board::state_db(repo), &board::log_db(repo))?)
+    Ok(State::open_board(repo)?)
 }
 
 /// Creates (or recreates) the view for a session at `base_root` and returns its path.

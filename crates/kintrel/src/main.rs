@@ -230,50 +230,7 @@ async fn main() -> anyhow::Result<()> {
             exit_when_board_goes(&cli.repo)?;
             daemon::run(Options { repo: cli.repo, durability, promote_every }).await?;
         }
-        Cmd::Agent { writable, command } => {
-            // Only in a view: in the repository the agent could write `.git/hooks`, which the
-            // person's Git would run.
-            let (view, marker) = view::find(&std::env::current_dir()?).context("run `kintrel agent` inside a view (`kintrel view create`)")?;
-            let repo = marker.repo;
-            // The marker is the agent's to write, so its repository must match where the view
-            // lives: views sit under their board's runtime directory, which no agent writes.
-            let runtime = kintrel_core::board::runtime_dir(&repo)?;
-            if !std::fs::canonicalize(&view)?.starts_with(std::fs::canonicalize(runtime.join("views"))?) {
-                bail!("{} is not a view of {}", view.display(), repo.display());
-            }
-            // Start the daemon outside the sandbox: it writes the board and creates the person key.
-            connect(&repo).await?;
-            let config = runtime.join("agent-claude");
-            if !config.exists() {
-                kintrel_core::os::create_private_dir(&config)?;
-                // Seeded with the person's settings (the Kintrel hooks); the agent can change only
-                // its copy, which the person's own unsandboxed Claude Code never reads.
-                if let Some(settings) = kintrel_core::os::home_dir().map(|h| h.join(".claude/settings.json")).filter(|p| p.exists()) {
-                    std::fs::copy(settings, config.join("settings.json"))?;
-                }
-            }
-            // A private temp directory (Windows: the AppContainer cannot use the person's).
-            let tmp = config.join("tmp");
-            std::fs::create_dir_all(&tmp)?;
-            let ours = [config.clone(), tmp.clone()];
-            let policy = kintrel_ci::sandbox::AgentPolicy {
-                view: &view,
-                ours: &ours,
-                extra: &writable,
-                board: &kintrel_core::board::data_dir(&repo),
-                keys: &kintrel_core::board::keys_dir()?,
-                socket: &daemon::socket_path(&repo)?,
-            };
-            let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![];
-            if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
-                env.push(("CLAUDE_CONFIG_DIR".into(), config.clone().into()));
-            }
-            if cfg!(windows) {
-                env.extend(["TEMP", "TMP"].map(|k| (k.into(), tmp.clone().into())));
-            }
-            let code = kintrel_ci::sandbox::run_agent(&command, &policy, &env, &std::env::current_dir()?).map_err(anyhow::Error::msg)?;
-            std::process::exit(code);
-        }
+        Cmd::Agent { writable, command } => std::process::exit(agent(&writable, &command).await?),
         Cmd::Daemon { cmd: DaemonCmd::Metrics } => {
             let text: String = connect(&cli.repo).await?.call(proto::METRICS, &serde_json::json!({})).await?;
             print!("{text}");
@@ -322,7 +279,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::View { cmd: ViewCmd::Refresh { view } } => {
-            let (dir, mut marker) = view::find(&view.unwrap_or(std::env::current_dir()?))?;
+            let (dir, mut marker) = view::find(&or_cwd(view)?)?;
             if let Some(p) = post_view(&dir, None).await? {
                 println!("posted {} ({} atoms)", p.note_id.short(), p.atoms.len());
             }
@@ -379,16 +336,13 @@ async fn main() -> anyhow::Result<()> {
                 c.call(proto::READ_FILE, &proto::ReadFile { token: String::new(), path: path.clone(), at: Some(head) }).await?;
             let bytes = f.content.as_bytes();
             for a in kintrel_lang::segment(&path, bytes).atoms() {
+                let line = a.line(bytes);
                 let key = kintrel_lang::AtomKey { path: path.clone(), symbol: a.symbol };
-                let line = a.ranges.first().map_or(1, |r| 1 + bytes[..r.start as usize].iter().filter(|&&b| b == b'\n').count());
                 println!("{line:>6}  {key}");
             }
         }
         Cmd::Conflicts => {
-            let st = kintrel_core::state::State::open_with_log(
-                &kintrel_core::board::state_db(&cli.repo),
-                &kintrel_core::board::log_db(&cli.repo),
-            )?;
+            let st = kintrel_core::state::State::open_board(&cli.repo)?;
             let conflicts = st.open_conflicts()?;
             if cli.json {
                 println!("{}", serde_json::to_string(&conflicts)?);
@@ -404,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Intent { message, atoms, view } => announce(proto::INTENT, view, message, atoms, None, cli.json).await?,
         Cmd::Claim { message, atoms, lease_ms, view } => announce(proto::CLAIM, view, message, atoms, lease_ms, cli.json).await?,
         Cmd::Revert { note, view } => {
-            let (dir, mut marker) = view::find(&view.map_or_else(std::env::current_dir, Ok)?)?;
+            let (dir, mut marker) = view::find(&or_cwd(view)?)?;
             post_view(&dir, None).await?; // the revert merges against the view as the daemon knows it
             let mut c = connect(&marker.repo).await?;
             let p: proto::Posted = c.call(proto::REVERT, &proto::Revert { token: marker.token.clone(), note }).await?;
@@ -415,12 +369,12 @@ async fn main() -> anyhow::Result<()> {
             println!("view now at {}", r.base_root.short());
         }
         Cmd::Release { id, view } => {
-            let (_, marker) = view::find(&view.map_or_else(std::env::current_dir, Ok)?)?;
+            let (_, marker) = view::find(&or_cwd(view)?)?;
             let _: proto::Status = connect(&marker.repo).await?.call(proto::RELEASE, &proto::Release { token: marker.token, id }).await?;
             println!("released {id}");
         }
         Cmd::Checks { tier, at, view } => {
-            let dir = view.map_or_else(std::env::current_dir, Ok)?;
+            let dir = or_cwd(view)?;
             let (repo, token) = match view::find(&dir) {
                 Ok((d, m)) if at.is_none() => {
                     post_view(&d, None).await?;
@@ -437,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
                     let how = if o.cached { "cached".to_owned() } else { format!("{} ms", o.ms) };
                     println!("{} {} {} ({how})", if o.ok { "PASS" } else { "FAIL" }, o.check, o.target);
                     if !o.ok {
-                        for line in o.output.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev() {
+                        for line in kintrel::notices::tail(&o.output, 20).lines() {
                             println!("    {line}");
                         }
                     }
@@ -451,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Packages { at } => {
-            let st = kintrel_core::state::State::open_with_log(&kintrel_core::board::state_db(&cli.repo), &kintrel_core::board::log_db(&cli.repo))?;
+            let st = kintrel_core::state::State::open_board(&cli.repo)?;
             let root = match at {
                 Some(a) => a.parse::<Hash>().map_err(|_| anyhow::anyhow!("--at takes a full root hash"))?,
                 None => st.get_ref(kintrel_core::state::HEAD)?.context("no head")?,
@@ -465,7 +419,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Inbox { view, follow: true } => {
             // ponytail: polls every 500 ms; a `notices.subscribe` stream if latency matters.
-            let (_, marker) = view::find(&view.map_or_else(std::env::current_dir, Ok)?)?;
+            let (_, marker) = view::find(&or_cwd(view)?)?;
             loop {
                 for n in inbox(&marker).await? {
                     println!("{}", serde_json::to_string(&n)?);
@@ -474,7 +428,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Inbox { view, follow: false } => {
-            let dir = view.map_or_else(std::env::current_dir, Ok)?;
+            let dir = or_cwd(view)?;
             let (_, marker) = view::find(&dir)?;
             let n = inbox(&marker).await?;
             if cli.json {
@@ -490,26 +444,7 @@ async fn main() -> anyhow::Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string(&s)?);
             } else {
-                let root = |r: Option<Hash>| r.map_or("none".into(), |h| h.short());
-                println!(
-                    "sessions  {}\nnotes     {} ({} folded, last pass {} ms)\nhead      {}\npromoted  {} ({} behind head{})\nconflicts {}\nchecks    {} pending",
-                    s.sessions,
-                    s.notes,
-                    s.folded,
-                    s.pass_ms,
-                    root(s.head),
-                    root(s.promoted),
-                    if s.unpromoted == 1 { "1 note".to_string() } else { format!("{} notes", s.unpromoted) },
-                    if s.unpromoted > 0 { format!(", waiting {} s", s.promotion_wait_ms / 1000) } else { String::new() },
-                    s.conflicts,
-                    s.ci_pending
-                );
-                if !s.blocked.is_empty() {
-                    println!("promotion blocked: {} do not parse", s.blocked.join(", "));
-                }
-                if !s.failing.is_empty() {
-                    println!("promotion blocked: gate checks failing: {}", s.failing.join(", "));
-                }
+                print_status(&s);
             }
         }
         Cmd::Init { from_git } => {
@@ -527,7 +462,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Log { author, limit } => {
-            let st = kintrel_core::state::State::open_with_log(&kintrel_core::board::state_db(&cli.repo), &kintrel_core::board::log_db(&cli.repo))?;
+            let st = kintrel_core::state::State::open_board(&cli.repo)?;
             let entries = st.log(author.as_deref(), limit)?;
             if cli.json {
                 println!("{}", serde_json::to_string(&entries)?);
@@ -551,10 +486,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Export { branch } => {
-            let st = kintrel_core::state::State::open_with_log(
-                &kintrel_core::board::state_db(&cli.repo),
-                &kintrel_core::board::log_db(&cli.repo),
-            )?;
+            let st = kintrel_core::state::State::open_board(&cli.repo)?;
             let root = st.get_ref(kintrel_core::state::PROMOTED)?.context("no promoted root")?;
             match kintrel::git::export(&st, &cli.repo, root, &branch)? {
                 Some(commit) => println!("exported {} as {commit} on {branch}", root.short()),
@@ -563,6 +495,79 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `kintrel agent`: runs `command` sandboxed to the current view, and returns its exit code.
+async fn agent(writable: &[PathBuf], command: &[std::ffi::OsString]) -> anyhow::Result<i32> {
+    // Only in a view: in the repository the agent could write `.git/hooks`, which the
+    // person's Git would run.
+    let (view, marker) = view::find(&std::env::current_dir()?).context("run `kintrel agent` inside a view (`kintrel view create`)")?;
+    let repo = marker.repo;
+    // The marker is the agent's to write, so its repository must match where the view
+    // lives: views sit under their board's runtime directory, which no agent writes.
+    let runtime = kintrel_core::board::runtime_dir(&repo)?;
+    if !std::fs::canonicalize(&view)?.starts_with(std::fs::canonicalize(runtime.join("views"))?) {
+        bail!("{} is not a view of {}", view.display(), repo.display());
+    }
+    // Start the daemon outside the sandbox: it writes the board and creates the person key.
+    connect(&repo).await?;
+    let config = runtime.join("agent-claude");
+    if !config.exists() {
+        kintrel_core::os::create_private_dir(&config)?;
+        // Seeded with the person's settings (the Kintrel hooks); the agent can change only
+        // its copy, which the person's own unsandboxed Claude Code never reads.
+        if let Some(settings) = kintrel_core::os::home_dir().map(|h| h.join(".claude/settings.json")).filter(|p| p.exists()) {
+            std::fs::copy(settings, config.join("settings.json"))?;
+        }
+    }
+    // A private temp directory (Windows: the AppContainer cannot use the person's).
+    let tmp = config.join("tmp");
+    std::fs::create_dir_all(&tmp)?;
+    let ours = [config.clone(), tmp.clone()];
+    let policy = kintrel_ci::sandbox::AgentPolicy {
+        view: &view,
+        ours: &ours,
+        extra: writable,
+        board: &kintrel_core::board::data_dir(&repo),
+        keys: &kintrel_core::board::keys_dir()?,
+        socket: &daemon::socket_path(&repo)?,
+    };
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![];
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+        env.push(("CLAUDE_CONFIG_DIR".into(), config.into()));
+    }
+    if cfg!(windows) {
+        env.extend(["TEMP", "TMP"].map(|k| (k.into(), tmp.clone().into())));
+    }
+    kintrel_ci::sandbox::run_agent(command, &policy, &env, &std::env::current_dir()?).map_err(anyhow::Error::msg)
+}
+
+fn print_status(s: &proto::StatusInfo) {
+    let root = |r: Option<Hash>| r.map_or("none".into(), |h| h.short());
+    println!(
+        "sessions  {}\nnotes     {} ({} folded, last pass {} ms)\nhead      {}\npromoted  {} ({} behind head{})\nconflicts {}\nchecks    {} pending",
+        s.sessions,
+        s.notes,
+        s.folded,
+        s.pass_ms,
+        root(s.head),
+        root(s.promoted),
+        if s.unpromoted == 1 { "1 note".to_string() } else { format!("{} notes", s.unpromoted) },
+        if s.unpromoted > 0 { format!(", waiting {} s", s.promotion_wait_ms / 1000) } else { String::new() },
+        s.conflicts,
+        s.ci_pending
+    );
+    if !s.blocked.is_empty() {
+        println!("promotion blocked: {} do not parse", s.blocked.join(", "));
+    }
+    if !s.failing.is_empty() {
+        println!("promotion blocked: gate checks failing: {}", s.failing.join(", "));
+    }
+}
+
+/// `dir`, or the current directory.
+fn or_cwd(dir: Option<PathBuf>) -> std::io::Result<PathBuf> {
+    dir.map_or_else(std::env::current_dir, Ok)
 }
 
 async fn start_session(repo: &Path, agent: String) -> anyhow::Result<proto::SessionStarted> {
@@ -621,7 +626,7 @@ async fn announce(
     lease_ms: Option<u64>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let (_, marker) = view::find(&view.map_or_else(std::env::current_dir, Ok)?)?;
+    let (_, marker) = view::find(&or_cwd(view)?)?;
     let req = proto::Announce { token: marker.token.clone(), summary, targets, lease_ms };
     let a: proto::Announced = connect(&marker.repo).await?.call(method, &req).await?;
     if json {
@@ -661,7 +666,7 @@ fn review_config(repo: &Path) -> anyhow::Result<(Option<Hash>, Hash)> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("approving kintrel.toml needs a person at an interactive terminal");
     }
-    let st = kintrel_core::state::State::open_with_log(&kintrel_core::board::state_db(repo), &kintrel_core::board::log_db(repo))?;
+    let st = kintrel_core::state::State::open_board(repo)?;
     let text = |r: Option<Hash>| -> anyhow::Result<(Option<Hash>, String)> {
         let id = r.map(|r| kintrel_ci::config_of(&st, r)).transpose()?.flatten();
         let body = id.map(|id| st.get_blob(id)).transpose()?.flatten().map(|b| String::from_utf8_lossy(&b).into_owned());

@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -89,6 +88,11 @@ impl State {
         Ok(st)
     }
 
+    /// A board's `state.db` with its `log.db` attached.
+    pub fn open_board(repo: &Path) -> Result<Self> {
+        Self::open_with_log(&crate::board::state_db(repo), &crate::board::log_db(repo))
+    }
+
     /// Runs `f` in one transaction; a bulk import is orders of magnitude faster this way.
     pub fn batch<T>(&mut self, f: impl FnOnce(&State) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("BEGIN")?;
@@ -110,6 +114,11 @@ impl State {
             .prepare_cached("INSERT OR IGNORE INTO blobs (id, len, data) VALUES (?1, ?2, ?3)")?
             .execute(params![&id.0[..], data.len() as u64, blob::compress(data)])?;
         Ok(id)
+    }
+
+    /// A blob that must exist: a missing one means the store is corrupt.
+    pub fn blob(&self, id: Hash) -> Result<Vec<u8>> {
+        self.get_blob(id)?.ok_or_else(|| Error::Corrupt(format!("missing blob {id}")))
     }
 
     pub fn get_blob(&self, id: Hash) -> Result<Option<Vec<u8>>> {
@@ -463,7 +472,7 @@ impl State {
     }
 
     fn write_refs(&self, head: Hash, promoted: Hash, reason: &str) -> Result<()> {
-        let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let at = crate::now_ms() as i64;
         let mut set = self.conn.prepare_cached("INSERT OR REPLACE INTO refs (name, root) VALUES (?1, ?2)")?;
         set.execute(params![HEAD, &head.0[..]])?;
         set.execute(params![PROMOTED, &promoted.0[..]])?;

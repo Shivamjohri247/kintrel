@@ -210,7 +210,7 @@ impl KintrelMcp {
             .atoms()
             .into_iter()
             .map(|at| {
-                let line = at.ranges.first().map_or(1, |r| 1 + bytes[..r.start as usize].iter().filter(|&&b| b == b'\n').count());
+                let line = at.line(bytes);
                 format!("{line:>5}  {}", AtomKey { path: a.path.clone(), symbol: at.symbol })
             })
             .collect();
@@ -251,17 +251,13 @@ impl KintrelMcp {
     #[tool(description = "Move your view to the current head to see other agents' work. Reports your notes that conflicted.")]
     async fn kintrel_refresh(&self) -> Result<CallToolResult, McpError> {
         let r: Refreshed = self.call(proto::SESSION_REFRESH, |token| Refresh { token: token.into() }).await?;
-        let lost: Vec<String> = r.lost.iter().map(|n| n.short()).collect();
+        let lost: Vec<String> = r.lost.iter().map(kintrel_core::Hash::short).collect();
         text(format!("view now at {}; conflicted notes: {}", r.base_root.short(), if lost.is_empty() { "none".into() } else { lost.join(", ") }))
     }
 
     #[tool(description = "List open conflicts: the symbol, the note that lost and the note kept in head.")]
     async fn kintrel_conflicts(&self) -> Result<CallToolResult, McpError> {
-        let st = kintrel_core::state::State::open_with_log(
-            &kintrel_core::board::state_db(&self.repo),
-            &kintrel_core::board::log_db(&self.repo),
-        )
-        .map_err(err)?;
+        let st = kintrel_core::state::State::open_board(&self.repo).map_err(err)?;
         let list: Vec<String> = st
             .open_conflicts()
             .map_err(err)?

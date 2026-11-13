@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use kintrel::daemon::{self, Options};
 use kintrel::rpc::Client;
 use kintrel_core::log::Durability;
-use kintrel_core::proto::{self, FileWrite, Inbox, Notices, Post, Posted, SessionStart, SessionStarted, StatusInfo};
+use kintrel_core::proto::{self, FileWrite, Inbox, NoticeKind, Notices, Post, Posted, SessionStart, SessionStarted, StatusInfo};
 
 const CONFIG: &str = r#"
 [[check]]
@@ -70,7 +70,7 @@ async fn gate_blocks_and_feedback_is_fast() {
     let _: Posted = c.call(proto::POST, &post("FAIL here\n")).await.unwrap();
     let notice = loop {
         let n: Notices = c.call(proto::INBOX, &Inbox { token: s.token.clone() }).await.unwrap();
-        if let Some(n) = n.notices.into_iter().find(|n| n.kind == "ci_failed") {
+        if let Some(n) = n.notices.into_iter().find(|n| n.kind == NoticeKind::CiFailed) {
             break n;
         }
         if posted_at.elapsed() > Duration::from_secs(5) {
@@ -100,7 +100,7 @@ async fn gate_blocks_and_feedback_is_fast() {
     let head: proto::FileContent = c.call(proto::READ_FILE, &read(st.head)).await.unwrap();
     assert_eq!(head.content, "ok\n", "the failing note is out of head");
     let n: Notices = c.call(proto::INBOX, &Inbox { token: s.token.clone() }).await.unwrap();
-    let rejected = n.notices.iter().find(|n| n.kind == "rejected").expect("author told");
+    let rejected = n.notices.iter().find(|n| n.kind == NoticeKind::Rejected).expect("author told");
     assert_eq!(rejected.check.as_deref(), Some("no-fail-marker"));
     let r: proto::Refreshed = c.call(proto::SESSION_REFRESH, &proto::Refresh { token: s.token.clone() }).await.unwrap();
     assert_eq!(r.lost.len(), 1, "a rejected note is lost");
@@ -194,7 +194,7 @@ async fn bisection_rejects_only_the_culprit() {
     assert_eq!(text(c.call(proto::READ_FILE, &read("b.txt")).await.unwrap()), "b\n", "only the culprit is out");
     assert_eq!(text(c.call(proto::READ_FILE, &read("c.txt")).await.unwrap()), "c2\n");
     let n: Notices = c.call(proto::INBOX, &Inbox { token: bad_token }).await.unwrap();
-    let r = n.notices.iter().find(|n| n.kind == "rejected").expect("culprit's author told");
+    let r = n.notices.iter().find(|n| n.kind == NoticeKind::Rejected).expect("culprit's author told");
     assert_eq!(r.by.as_ref().unwrap().note, bad.note_id.short());
     std::fs::remove_dir_all(kintrel_core::board::runtime_dir(&repo).unwrap()).ok();
     std::fs::remove_dir_all(&repo).ok();
@@ -237,7 +237,7 @@ async fn deploys_and_the_backstop() {
     }
     let incident = loop {
         let n: Notices = c.call(proto::INBOX, &Inbox { token: token.clone() }).await.unwrap();
-        if let Some(n) = n.notices.into_iter().find(|n| n.kind == "incident") {
+        if let Some(n) = n.notices.into_iter().find(|n| n.kind == NoticeKind::Incident) {
             break n;
         }
         assert!(start.elapsed() < Duration::from_secs(20), "no incident after the backstop run");

@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
@@ -52,6 +51,12 @@ pub struct NewBlob {
     pub id: Hash,
     pub len: u64,
     pub zstd: Vec<u8>,
+}
+
+impl NewBlob {
+    pub fn of(bytes: &[u8]) -> Self {
+        NewBlob { id: Hash::of(bytes), len: bytes.len() as u64, zstd: crate::blob::compress(bytes) }
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -184,7 +189,7 @@ fn run(mut conn: Connection, rx: Receiver<Req>, last_gseq: Arc<AtomicU64>, wal: 
 }
 
 fn write_batch(conn: &mut Connection, batch: &[Req], mut gseq: u64) -> rusqlite::Result<(Vec<u64>, u64)> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    let now = crate::now_ms() as i64;
     let tx = conn.transaction()?;
     let mut out = Vec::with_capacity(batch.len());
     {

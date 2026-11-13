@@ -58,7 +58,7 @@ pub fn checkout(state: &State, root: Hash, dest: &Path) -> Result<()> {
     fs::create_dir(dest)?;
     for e in state.get_tree(root)?.entries() {
         let path = dest.join(&e.name);
-        let blob = || state.get_blob(e.id)?.ok_or_else(|| Error::Corrupt(format!("missing blob {}", e.id)));
+        let blob = || state.blob(e.id);
         match e.kind {
             Kind::Dir => checkout(state, e.id, &path)?,
             Kind::Symlink => crate::os::write_symlink(&blob()?, &path)?,

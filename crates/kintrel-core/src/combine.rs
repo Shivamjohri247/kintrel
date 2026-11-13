@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, SyncSender, sync_channel};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ use crate::merge::merge3;
 use crate::note::{AtomDetail, AtomKey, Note, Op, atom_details};
 use crate::state::{self, State};
 use crate::tree::Kind;
-use crate::{Error, Hash, Result, board};
+use crate::{Error, Hash, Result};
 
 /// Larger files that both sides changed are a conflict rather than a merge: every pass refolds,
 /// so merge cost must stay bounded.
@@ -153,7 +153,7 @@ pub fn fold(src: &dyn Source, notes: &[(Hash, Note)]) -> Result<Folded> {
                 }
             };
             if result.is_some() && cur.is_none() && !fits(src, &out.files, &staged, path).unwrap_or(false) {
-                lost.push((path.to_owned(), AtomKey { path: path.to_owned(), symbol: vec![] }));
+                lost.push(file_level());
                 continue;
             }
             staged.insert(path.to_owned(), result);
@@ -215,15 +215,10 @@ pub fn diff_atoms(path: &str, old: Option<&[u8]>, new: Option<&[u8]>) -> Vec<Ato
 
 /// The atoms `note` changed, from each op's base to its content.
 fn changes_of(st: &State, note: &Note) -> Result<Vec<AtomChange>> {
-    let blob = |id: Option<Hash>| -> Result<Option<Vec<u8>>> {
-        id.map(|id| st.get_blob(id)?.ok_or_else(|| Error::Corrupt(format!("missing blob {id}")))).transpose()
-    };
+    let blob = |id: Option<Hash>| id.map(|id| st.blob(id)).transpose();
     let mut out = vec![];
     for op in &note.ops {
-        let (base, new) = match op {
-            Op::Write { base, content, .. } => (*base, Some(*content)),
-            Op::Delete { base, .. } => (Some(*base), None),
-        };
+        let (base, new) = op.sides();
         out.extend(diff_atoms(op.path(), blob(base)?.as_deref(), blob(new)?.as_deref()));
     }
     Ok(out)
@@ -258,12 +253,7 @@ fn pass_events(
     }
     for c in folded.conflicts.iter().filter(|c| !seen.conflicted.contains(&c.losing)) {
         let n = by_id[&c.losing];
-        let op = n.ops.iter().find(|op| op.path() == c.atom.path);
-        let (base, theirs) = match op {
-            Some(Op::Write { base, content, .. }) => (*base, Some(*content)),
-            Some(Op::Delete { base, .. }) => (Some(*base), None),
-            None => (None, None),
-        };
+        let (base, theirs) = n.ops.iter().find(|op| op.path() == c.atom.path).map_or((None, None), Op::sides);
         let kept = st.lookup(head, &c.atom.path)?.map(|(_, id)| id);
         out.push(Event::Conflicted {
             note: c.losing,
@@ -336,12 +326,12 @@ impl Combiner {
     /// Each pass's [`Event`]s go to `events`, if given.
     pub fn spawn(
         repo: &Path,
-        heads: Arc<Mutex<Heads>>,
+        heads: tokio::sync::watch::Sender<Heads>,
         promote_every: Option<Duration>,
         events: Option<Sender<Vec<Event>>>,
         gate: Option<Arc<dyn Gate>>,
     ) -> Result<Self> {
-        let mut st = State::open_with_log(&board::state_db(repo), &board::log_db(repo))?;
+        let mut st = State::open_board(repo)?;
         let mut rejected = st.rejected_notes()?;
         let (wake, rx) = sync_channel::<()>(1);
         let promote = Arc::new(AtomicBool::new(false));
@@ -424,20 +414,20 @@ struct PassOut {
 /// One combiner pass.
 fn pass(
     st: &mut State,
-    heads: &Mutex<Heads>,
+    heads: &tokio::sync::watch::Sender<Heads>,
     may_promote: bool,
     gate: Option<&dyn Gate>,
     rejected: &mut HashSet<Hash>,
 ) -> Result<PassOut> {
     let start = std::time::Instant::now();
-    for note in gate.map(|g| g.rejected()).unwrap_or_default() {
+    for note in gate.map(Gate::rejected).unwrap_or_default() {
         st.reject(note)?;
         rejected.insert(note);
     }
     let mut promoted = st.get_ref(state::PROMOTED)?.ok_or_else(|| Error::Corrupt("no promoted ref".into()))?;
     let mut mark = st.get_mark(state::PROMOTED_GSEQ)?;
     // A candidate whose checks finished passing while head moved on is promoted first.
-    if let Some((root, gseq)) = gate.and_then(|g| g.passed())
+    if let Some((root, gseq)) = gate.and_then(Gate::passed)
         && gseq > mark
     {
         let head = st.get_ref(state::HEAD)?.ok_or_else(|| Error::Corrupt("no head ref".into()))?;
@@ -498,13 +488,11 @@ fn pass(
             g.promoted(head);
         }
     }
-    // Its own statement: a guard taken inside the assignment below would live to its end.
-    let before = heads.lock().unwrap().clone();
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-    let promoted_ms = if promoted != before.promoted { now_ms } else { before.promoted_ms };
+    let before = heads.borrow().clone();
+    let promoted_ms = if promoted != before.promoted { crate::now_ms() } else { before.promoted_ms };
     let passes = before.passes + 1;
     crate::metrics::COMBINER_PASS_MS.add(start.elapsed().as_millis() as u64);
-    *heads.lock().unwrap() = Heads {
+    heads.send_replace(Heads {
         head,
         promoted,
         conflicts: st.open_conflict_count()?,
@@ -515,7 +503,7 @@ fn pass(
         passes,
         promoted_gseq: mark,
         promoted_ms,
-    };
+    });
     Ok(PassOut { promoted: promote, gate_pending, head, notes, folded })
 }
 
@@ -532,7 +520,7 @@ fn parse_gate(st: &State, folded: &Folded) -> Result<Vec<String>> {
         }
         let bytes = match folded.blobs.get(id) {
             Some(b) => b.clone(),
-            None => st.get_blob(*id)?.ok_or_else(|| Error::Corrupt(format!("missing blob {id}")))?,
+            None => st.blob(*id)?,
         };
         if kintrel_lang::segment_checked(path, &bytes).is_none() {
             blocked.push(path.clone());
@@ -552,7 +540,7 @@ impl Source for Promoted<'_> {
         self.st.lookup(self.root, path)
     }
     fn blob(&self, id: Hash) -> Result<Vec<u8>> {
-        self.st.get_blob(id)?.ok_or_else(|| Error::Corrupt(format!("missing blob {id}")))
+        self.st.blob(id)
     }
 }
 
@@ -808,7 +796,7 @@ mod tests {
         let n1 = note(1, 1, vec![], vec![write(&mut m, "x", None, "file\n")]);
         let n2 = note(2, 1, vec![], vec![write(&mut m, "x/y", None, "nested\n")]);
         let n3 = note(3, 1, vec![], vec![write(&mut m, "a.py/z", None, "under a file\n")]);
-        let f = fold(&m, &[n1.clone(), n2.clone(), n3.clone()]).unwrap();
+        let f = fold(&m, &[n1.clone(), n2, n3]).unwrap();
         assert_eq!(f.applied, [n1.0]);
         assert_eq!(f.conflicts.len(), 2);
     }

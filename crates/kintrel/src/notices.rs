@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use kintrel_core::combine::{AtomChange, Event};
 use kintrel_core::note::{AtomKey, ref_name};
-use kintrel_core::proto::{ClaimInfo, Notice, NoticeBy};
+use kintrel_core::proto::{ClaimInfo, Notice, NoticeBy, NoticeKind};
 
 /// Notices per session per minute; the rest are summarized as one `many_changes`.
 pub const RATE: usize = 30;
@@ -30,7 +30,7 @@ pub const LEASE: Duration = Duration::from_secs(600);
 /// Every session's footprint and inbox, plus the live claims and intents.
 #[derive(Default)]
 pub struct Coord {
-    pub sessions: HashMap<u64, Interest>,
+    sessions: HashMap<u64, Interest>,
     claims: Vec<Claim>,
     next_claim: u64,
     /// Counts applied notes routed so far; a session has seen everything up to its `seen`.
@@ -97,6 +97,19 @@ impl Coord {
         }
     }
 
+    /// Takes the session's unread notices.
+    pub fn take_inbox(&mut self, session: u64) -> Vec<Notice> {
+        self.sessions.get_mut(&session).map(Interest::take).unwrap_or_default()
+    }
+
+    /// Adds files to the session's footprint; returns the ones new to it.
+    pub fn add_paths(&mut self, session: u64, paths: impl IntoIterator<Item = String>) -> Vec<String> {
+        match self.sessions.get_mut(&session) {
+            Some(int) => paths.into_iter().filter(|p| int.paths.insert(p.clone())).collect(),
+            None => vec![],
+        }
+    }
+
     /// A session posted `changes`. Its atoms now count as its code for dependents (rule 3),
     /// and it is caught up on changes it has not seen (signature, body or deletion) to the
     /// names that code uses. Live events still reach dependents for signature changes only
@@ -105,10 +118,10 @@ impl Coord {
     pub fn wrote(&mut self, session: u64, changes: &[AtomChange]) {
         let Some(int) = self.sessions.get_mut(&session) else { return };
         int.written.extend(changes.iter().map(|c| c.atom.path.clone()));
+        int.add_refs(changes);
         let mut uses: HashMap<&str, BTreeSet<String>> = HashMap::new();
         for c in changes {
             for word in &c.idents {
-                int.refs.entry(word.clone()).or_default().insert(c.atom.to_string());
                 uses.entry(word).or_default().insert(c.atom.to_string());
             }
         }
@@ -125,10 +138,7 @@ impl Coord {
             }
             // Body changes count here too: this code was just written against the old body
             // (B4: a return type or units change keeps the signature).
-            let (kind, action) = match &c.after {
-                None => ("deleted".into(), "refresh; stop using it, or ask its author".into()),
-                Some(_) => change_kind(c.before != c.after),
-            };
+            let (kind, action) = change_kind(c.after.is_none(), c.before != c.after);
             out.push(Notice { kind, atom: own, by: Some(by.clone()), before: c.before.clone(), after: c.after.clone(), you_affected, action, ..Notice::default() });
         }
         for n in out {
@@ -149,7 +159,7 @@ impl Coord {
     }
 
     fn alive(&self, c: &Claim) -> bool {
-        self.sessions.get(&c.session).and_then(|s| s.last_active).is_some_and(|t| t.elapsed() < c.lease)
+        alive(&self.sessions, c)
     }
 
     /// Records an intent or claim; returns its id and the live claims and intents of other
@@ -163,7 +173,7 @@ impl Coord {
         targets: Vec<AtomKey>,
         lease: Duration,
     ) -> (u64, Vec<ClaimInfo>) {
-        self.claims.retain(|c| self.sessions.get(&c.session).and_then(|s| s.last_active).is_some_and(|t| t.elapsed() < c.lease));
+        self.claims.retain(|c| alive(&self.sessions, c));
         self.next_claim += 1;
         let agent = self.sessions.get(&session).map_or_else(String::new, |s| s.agent.clone());
         let claim = Claim { id: self.next_claim, session, agent, intent, summary, targets, lease };
@@ -175,7 +185,7 @@ impl Coord {
         for c in &overlapping {
             let atom = claim.targets.iter().find_map(|t| c.hits(t)).expect("overlaps").to_string();
             out.push((c.session, Notice {
-                kind: "claim_overlap".into(),
+                kind: NoticeKind::ClaimOverlap,
                 atom,
                 by: Some(by.clone()),
                 summary: Some(quote(&claim.summary)),
@@ -216,7 +226,7 @@ impl Coord {
         let mut out = vec![];
         for c in self.claims.iter().filter(|c| !c.intent && c.session != session && self.alive(c)) {
             let Some(atom) = atoms.iter().find(|a| c.hits(a).is_some()) else { continue };
-            let base = Notice { kind: "claim_overlap".into(), atom: atom.to_string(), summary: Some(quote(&c.summary)), ..Notice::default() };
+            let base = Notice { kind: NoticeKind::ClaimOverlap, atom: atom.to_string(), summary: Some(quote(&c.summary)), ..Notice::default() };
             out.push((session, Notice {
                 by: Some(NoticeBy { agent: c.agent.clone(), note: format!("claim {}", c.id) }),
                 action: "another agent claimed this; your change still applies: check with them that it fits".into(),
@@ -256,12 +266,11 @@ impl Coord {
                 if !int.ci_seen.insert(o.key) {
                     continue;
                 }
-                let tail: Vec<&str> = o.output.lines().rev().take(12).collect();
                 int.push(Notice {
-                    kind: "ci_failed".into(),
+                    kind: NoticeKind::CiFailed,
                     atom: if o.target.is_empty() { "(repository)".into() } else { o.target.clone() },
-                    check: Some(format!("{} ({:?})", o.check, o.tier).to_lowercase()),
-                    output: Some(truncate(&tail.into_iter().rev().collect::<Vec<_>>().join("\n"))),
+                    check: Some(format!("{} ({})", o.check, o.tier.name())),
+                    output: Some(truncate(&tail(&o.output, 12))),
                     action: "a check fails on head with your changes in it: run `kintrel checks` in your view, fix it, and post".into(),
                     ..Notice::default()
                 });
@@ -273,13 +282,12 @@ impl Coord {
     pub fn rejected(&mut self, session: u64, note: kintrel_core::Hash, failing: &[kintrel_ci::Outcome]) {
         let Some(int) = self.sessions.get_mut(&session) else { return };
         let checks: Vec<String> = failing.iter().map(|o| o.check.clone()).collect();
-        let tail = failing.first().map(|o| o.output.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
         int.push(Notice {
-            kind: "rejected".into(),
+            kind: NoticeKind::Rejected,
             atom: failing.first().map_or(String::new(), |o| o.target.clone()),
             by: Some(NoticeBy { agent: "you".into(), note: note.short() }),
             check: Some(checks.join(", ")),
-            output: tail.map(|t| truncate(&t)),
+            output: failing.first().map(|o| truncate(&tail(&o.output, 12))),
             action: "this note broke a gate check and was left out of head: refresh, fix it, and post again".into(),
             ..Notice::default()
         });
@@ -289,9 +297,9 @@ impl Coord {
     pub fn merge_proposed(&mut self, session: u64, atom: &AtomKey, proposal: kintrel_core::Hash) {
         let Some(int) = self.sessions.get_mut(&session) else { return };
         int.push(Notice {
-            kind: "merge_proposed".into(),
+            kind: NoticeKind::MergeProposed,
             atom: atom.to_string(),
-            by: Some(NoticeBy { agent: "kintrel-tier3".into(), note: proposal.short() }),
+            by: Some(NoticeBy { agent: crate::daemon::TIER3_AGENT.into(), note: proposal.short() }),
             action: "Kintrel's Tier 3 proposed a merge of your conflicting change and posted it; refresh and check it is what you meant".into(),
             ..Notice::default()
         });
@@ -302,11 +310,90 @@ impl Coord {
         let checks: Vec<String> = failing.iter().map(|o| o.check.clone()).collect();
         for int in self.sessions.values_mut() {
             int.push(Notice {
-                kind: "incident".into(),
+                kind: NoticeKind::Incident,
                 check: Some(checks.join(", ")),
                 action: "the full check suite fails on the promoted code; promotion now waits for every check to pass".into(),
                 ..Notice::default()
             });
+        }
+    }
+
+    /// Delivers one pass's events.
+    pub fn route(&mut self, events: Vec<Event>) {
+        for ev in events {
+            if let Event::Applied { note, session, agent, changes } = &ev {
+                self.epoch += 1;
+                for c in changes.iter().filter(|c| c.before.is_some()) {
+                    let Some(name) = ref_name(&c.atom) else { continue };
+                    let by = NoticeBy { agent: agent.clone(), note: note.short() };
+                    let entry = Change { epoch: self.epoch, session: *session, by, change: c.clone() };
+                    self.history.entry(name.to_owned()).or_default().push(entry);
+                    self.order.push_back((self.epoch, name.to_owned()));
+                }
+                while self.order.len() > HISTORY {
+                    let (epoch, name) = self.order.pop_front().expect("non-empty");
+                    if let Some(v) = self.history.get_mut(&name) {
+                        v.retain(|h| h.epoch != epoch);
+                        if v.is_empty() {
+                            self.history.remove(&name);
+                        }
+                    }
+                }
+                // An intent ends once its session's code touches every target (SPEC §7.4).
+                self.claims.retain(|c| {
+                    !(c.intent && c.session == *session && c.targets.iter().all(|t| changes.iter().any(|ch| overlaps(t, &ch.atom))))
+                });
+            }
+            let sessions = &mut self.sessions;
+            match ev {
+                Event::Applied { note, session, agent, changes } => {
+                    let by = NoticeBy { agent, note: note.short() };
+                    for (&id, int) in sessions.iter_mut() {
+                        if id == session {
+                            int.add_refs(&changes);
+                            continue;
+                        }
+                        for c in &changes {
+                            if let Some(n) = notice_for(int, c, Some(&by)) {
+                                int.push(n);
+                            }
+                        }
+                    }
+                }
+                Event::Conflicted { note, session, conflict, base, kept, theirs } => {
+                    let Some(int) = sessions.get_mut(&session) else { continue };
+                    let cut = |t: Option<String>| t.map(|t| truncate(&t));
+                    int.push(Notice {
+                        kind: NoticeKind::Conflict,
+                        atom: conflict.atom.to_string(),
+                        by: Some(NoticeBy { agent: "you".into(), note: note.short() }),
+                        base: cut(base),
+                        kept: cut(kept),
+                        theirs: cut(theirs),
+                        action: "your note is not in head (all of it, atomically): refresh, then redo your change on top of `kept`".into(),
+                        ..Notice::default()
+                    });
+                }
+            }
+        }
+    }
+
+    /// Catches a session up on a file it just touched for the first time: `changes` are what other
+    /// agents changed in it between the session's base and head, before the session cared. Pass
+    /// events only reach sessions already interested, so without this an agent that opens a file
+    /// after someone changed it would never hear about it.
+    // ponytail: same-file only; dependents in other files are caught up only by later events.
+    /// Live intents on the file are caught up the same way.
+    pub fn catch_up(&mut self, session: u64, paths: &[String], changes: &[AtomChange]) {
+        let intents: Vec<Notice> = paths.iter().flat_map(|p| self.intents_on(session, p)).collect();
+        let Some(int) = self.sessions.get_mut(&session) else { return };
+        for c in changes {
+            if let Some(n) = notice_for(int, c, None) {
+                int.push(n);
+            }
+        }
+        for n in intents {
+            int.push(n);
         }
     }
 
@@ -320,9 +407,14 @@ impl Coord {
     }
 }
 
+/// The claim's session has been active within its lease.
+fn alive(sessions: &HashMap<u64, Interest>, c: &Claim) -> bool {
+    sessions.get(&c.session).and_then(|s| s.last_active).is_some_and(|t| t.elapsed() < c.lease)
+}
+
 fn intent_notice(c: &Claim, target: &AtomKey) -> Notice {
     Notice {
-        kind: "intent".into(),
+        kind: NoticeKind::Intent,
         atom: target.to_string(),
         by: Some(NoticeBy { agent: c.agent.clone(), note: format!("intent {}", c.id) }),
         summary: Some(quote(&c.summary)),
@@ -343,7 +435,7 @@ pub struct Interest {
     /// Last request from the session; renews its leases.
     last_active: Option<Instant>,
     /// Files read through the API or written.
-    pub paths: HashSet<String>,
+    paths: HashSet<String>,
     /// Identifier → the session's written atoms that mention it.
     refs: HashMap<String, BTreeSet<String>>,
     inbox: Vec<Notice>,
@@ -353,17 +445,26 @@ pub struct Interest {
 }
 
 impl Interest {
+    /// The session's code mentions each changed atom's identifiers (dependents, rule 3).
+    fn add_refs(&mut self, changes: &[AtomChange]) {
+        for c in changes {
+            for word in &c.idents {
+                self.refs.entry(word.clone()).or_default().insert(c.atom.to_string());
+            }
+        }
+    }
+
     /// Adds a notice, merging it into an unread one about the same atom (SPEC §8.4).
     fn push(&mut self, n: Notice) {
-        if is_change(&n.kind)
-            && let Some(old) = self.inbox.iter_mut().find(|o| is_change(&o.kind) && o.atom == n.atom)
+        if n.kind.is_change()
+            && let Some(old) = self.inbox.iter_mut().find(|o| o.kind.is_change() && o.atom == n.atom)
         {
             let before = old.before.take();
             let mut affected: BTreeSet<String> = old.you_affected.drain(..).collect();
             affected.extend(n.you_affected.iter().cloned());
             *old = Notice { before, you_affected: affected.into_iter().collect(), ..n };
             if old.after.is_some() {
-                (old.kind, old.action) = change_kind(old.before != old.after);
+                (old.kind, old.action) = change_kind(false, old.before != old.after);
             }
             kintrel_core::metrics::NOTICES_COALESCED.add(1);
             return;
@@ -387,13 +488,13 @@ impl Interest {
     pub fn take(&mut self) -> Vec<Notice> {
         let mut out = std::mem::take(&mut self.inbox);
         for n in &mut out {
-            if n.kind == "body_changed" || n.before.as_deref() == Some("") {
+            if n.kind == NoticeKind::BodyChanged || n.before.as_deref() == Some("") {
                 (n.before, n.after) = (None, None);
             }
         }
         if !self.overflow.is_empty() {
             out.push(Notice {
-                kind: "many_changes".into(),
+                kind: NoticeKind::ManyChanges,
                 atoms: std::mem::take(&mut self.overflow).into_iter().collect(),
                 action: "too many changes to list one by one: refresh and re-read these".into(),
                 ..Notice::default()
@@ -403,99 +504,19 @@ impl Interest {
     }
 }
 
-fn is_change(kind: &str) -> bool {
-    matches!(kind, "body_changed" | "interface_changed" | "deleted")
+fn change_kind(deleted: bool, sig_changed: bool) -> (NoticeKind, String) {
+    let (kind, action) = match (deleted, sig_changed) {
+        (true, _) => (NoticeKind::Deleted, "refresh; stop using it, or ask its author"),
+        (false, true) => (NoticeKind::InterfaceChanged, "refresh, then update your code that uses it"),
+        (false, false) => (NoticeKind::BodyChanged, "refresh to see it; check your work still fits"),
+    };
+    (kind, action.into())
 }
 
-fn change_kind(sig_changed: bool) -> (String, String) {
-    if sig_changed {
-        ("interface_changed".into(), "refresh, then update your code that uses it".into())
-    } else {
-        ("body_changed".into(), "refresh to see it; check your work still fits".into())
-    }
-}
-
-/// Delivers one pass's events.
-pub fn route(coord: &mut Coord, events: Vec<Event>) {
-    for ev in events {
-        if let Event::Applied { note, session, agent, changes } = &ev {
-            coord.epoch += 1;
-            for c in changes.iter().filter(|c| c.before.is_some()) {
-                let Some(name) = ref_name(&c.atom) else { continue };
-                let by = NoticeBy { agent: agent.clone(), note: note.short() };
-                let entry = Change { epoch: coord.epoch, session: *session, by, change: c.clone() };
-                coord.history.entry(name.to_owned()).or_default().push(entry);
-                coord.order.push_back((coord.epoch, name.to_owned()));
-            }
-            while coord.order.len() > HISTORY {
-                let (epoch, name) = coord.order.pop_front().expect("non-empty");
-                if let Some(v) = coord.history.get_mut(&name) {
-                    v.retain(|h| h.epoch != epoch);
-                    if v.is_empty() {
-                        coord.history.remove(&name);
-                    }
-                }
-            }
-            // An intent ends once its session's code touches every target (SPEC §7.4).
-            coord.claims.retain(|c| {
-                !(c.intent && c.session == *session && c.targets.iter().all(|t| changes.iter().any(|ch| overlaps(t, &ch.atom))))
-            });
-        }
-        let sessions = &mut coord.sessions;
-        match ev {
-            Event::Applied { note, session, agent, changes } => {
-                let by = NoticeBy { agent, note: note.short() };
-                for (&id, int) in sessions.iter_mut() {
-                    if id == session {
-                        for c in &changes {
-                            for word in &c.idents {
-                                int.refs.entry(word.clone()).or_default().insert(c.atom.to_string());
-                            }
-                        }
-                        continue;
-                    }
-                    for c in &changes {
-                        if let Some(n) = notice_for(int, c, Some(&by)) {
-                            int.push(n);
-                        }
-                    }
-                }
-            }
-            Event::Conflicted { note, session, conflict, base, kept, theirs } => {
-                let Some(int) = sessions.get_mut(&session) else { continue };
-                let cut = |t: Option<String>| t.map(|t| truncate(&t));
-                int.push(Notice {
-                    kind: "conflict".into(),
-                    atom: conflict.atom.to_string(),
-                    by: Some(NoticeBy { agent: "you".into(), note: note.short() }),
-                    base: cut(base),
-                    kept: cut(kept),
-                    theirs: cut(theirs),
-                    action: "your note is not in head (all of it, atomically): refresh, then redo your change on top of `kept`".into(),
-                    ..Notice::default()
-                });
-            }
-        }
-    }
-}
-
-/// Catches a session up on a file it just touched for the first time: `changes` are what other
-/// agents changed in it between the session's base and head, before the session cared. Pass
-/// events only reach sessions already interested, so without this an agent that opens a file
-/// after someone changed it would never hear about it.
-// ponytail: same-file only; dependents in other files are caught up only by later events.
-/// Live intents on the file are caught up the same way.
-pub fn catch_up(coord: &mut Coord, session: u64, paths: &[String], changes: &[AtomChange]) {
-    let intents: Vec<Notice> = paths.iter().flat_map(|p| coord.intents_on(session, p)).collect();
-    let Some(int) = coord.sessions.get_mut(&session) else { return };
-    for c in changes {
-        if let Some(n) = notice_for(int, c, None) {
-            int.push(n);
-        }
-    }
-    for n in intents {
-        int.push(n);
-    }
+/// The last `n` lines of a check's output.
+pub fn tail(output: &str, n: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 /// The notice for one changed atom, if the session cares (SPEC §8.1 rules 1 and 3).
@@ -513,10 +534,7 @@ fn notice_for(int: &Interest, c: &AtomChange, by: Option<&NoticeBy>) -> Option<N
     if !reader && you_affected.is_empty() {
         return None;
     }
-    let (kind, action) = match &c.after {
-        None => ("deleted".into(), "refresh; stop using it, or ask its author".into()),
-        Some(_) => change_kind(sig_changed),
-    };
+    let (kind, action) = change_kind(c.after.is_none(), sig_changed);
     Some(Notice {
         kind,
         atom: c.atom.to_string(),
@@ -577,19 +595,19 @@ mod tests {
     fn coalesces_per_atom_and_rate_limits() {
         let mut sessions = Coord::default();
         sessions.start(1, "a".into());
-        sessions.sessions.get_mut(&1).unwrap().paths.insert("a.py".into());
+        sessions.add_paths(1, ["a.py".into()]);
         // A signature change then a body change to the same atom: one notice, first `before`.
-        route(&mut sessions, vec![applied(2, "a.py::def f", "def f():", "def f(x):"), applied(2, "a.py::def f", "def f(x):", "def f(x):")]);
-        let got = sessions.sessions.get_mut(&1).unwrap().take();
+        sessions.route(vec![applied(2, "a.py::def f", "def f():", "def f(x):"), applied(2, "a.py::def f", "def f(x):", "def f(x):")]);
+        let got = sessions.take_inbox(1);
         assert_eq!(got.len(), 1);
-        assert_eq!((got[0].kind.as_str(), got[0].before.as_deref(), got[0].after.as_deref()), ("interface_changed", Some("def f():"), Some("def f(x):")));
+        assert_eq!((got[0].kind, got[0].before.as_deref(), got[0].after.as_deref()), (NoticeKind::InterfaceChanged, Some("def f():"), Some("def f(x):")));
 
         let events = (0..RATE + 5).map(|i| applied(2, &format!("a.py::def f{i}"), "s", "s")).collect();
-        route(&mut sessions, events);
+        sessions.route(events);
         // The first notice used one of this minute's RATE.
-        let got = sessions.sessions.get_mut(&1).unwrap().take();
+        let got = sessions.take_inbox(1);
         assert_eq!(got.len(), RATE);
-        assert_eq!(got[RATE - 1].kind, "many_changes");
+        assert_eq!(got[RATE - 1].kind, NoticeKind::ManyChanges);
         assert_eq!(got[RATE - 1].atoms.len(), 6);
     }
 
@@ -597,7 +615,7 @@ mod tests {
         k.parse().unwrap()
     }
 
-    fn take(c: &mut Coord, id: u64) -> Vec<(String, String)> {
+    fn take(c: &mut Coord, id: u64) -> Vec<(NoticeKind, String)> {
         c.sessions.get_mut(&id).unwrap().take().into_iter().map(|n| (n.kind, n.atom)).collect()
     }
 
@@ -613,14 +631,14 @@ mod tests {
         c.posted(2, "n1", &[key("a.py::def fee")]);
         assert!(take(&mut c, 1).is_empty() && take(&mut c, 2).is_empty());
         c.posted(2, "n2", &[key("a.py::class Cart::def total")]);
-        assert_eq!(take(&mut c, 2), [("claim_overlap".into(), "a.py::class Cart::def total".into())]);
-        assert_eq!(take(&mut c, 1), [("claim_overlap".into(), "a.py::class Cart::def total".into())]);
+        assert_eq!(take(&mut c, 2), [(NoticeKind::ClaimOverlap, "a.py::class Cart::def total".into())]);
+        assert_eq!(take(&mut c, 1), [(NoticeKind::ClaimOverlap, "a.py::class Cart::def total".into())]);
 
         // A second claim on the file overlaps the first: the caller is told, the holder hears.
         let (_, over) = c.announce(2, false, "whole file".into(), vec![key("a.py")], LEASE);
         assert_eq!(over.len(), 1);
         assert_eq!(over[0].agent, "a");
-        assert_eq!(take(&mut c, 1), [("claim_overlap".into(), "a.py::class Cart".into())]);
+        assert_eq!(take(&mut c, 1), [(NoticeKind::ClaimOverlap, "a.py::class Cart".into())]);
 
         assert!(c.release(1, id));
         assert!(!c.release(1, id));
@@ -642,18 +660,18 @@ mod tests {
         c.start(3, "c".into());
         c.sessions.get_mut(&2).unwrap().paths.insert("a.py".into());
         c.announce(1, true, "price takes a currency".into(), vec![key("a.py::def price")], LEASE);
-        assert_eq!(take(&mut c, 2), [("intent".into(), "a.py::def price".into())]);
+        assert_eq!(take(&mut c, 2), [(NoticeKind::Intent, "a.py::def price".into())]);
         assert!(take(&mut c, 3).is_empty(), "c has not touched a.py");
 
         // c touches a.py later and is caught up on the live intent.
-        catch_up(&mut c, 3, &["a.py".into()], &[]);
-        assert_eq!(take(&mut c, 3), [("intent".into(), "a.py::def price".into())]);
+        c.catch_up(3, &["a.py".into()], &[]);
+        assert_eq!(take(&mut c, 3), [(NoticeKind::Intent, "a.py::def price".into())]);
 
         // a's code lands on the target: the intent ends, so a newcomer hears nothing.
         let change = AtomChange { atom: key("a.py::def price"), before: Some("x".into()), after: Some("y".into()), idents: vec![] };
-        route(&mut c, vec![Event::Applied { note: Hash::default(), session: 1, agent: "a".into(), changes: vec![change] }]);
+        c.route(vec![Event::Applied { note: Hash::default(), session: 1, agent: "a".into(), changes: vec![change] }]);
         c.start(4, "d".into());
-        catch_up(&mut c, 4, &["a.py".into()], &[]);
+        c.catch_up(4, &["a.py".into()], &[]);
         assert!(take(&mut c, 4).is_empty());
     }
 
@@ -686,7 +704,7 @@ mod tests {
         };
         c.ci_failed(std::slice::from_ref(&o));
         c.ci_failed(&[o]);
-        assert_eq!(take(&mut c, 1), [("ci_failed".into(), "(repository)".into())], "once per key");
+        assert_eq!(take(&mut c, 1), [(NoticeKind::CiFailed, "(repository)".into())], "once per key");
         assert!(take(&mut c, 2).is_empty(), "README.md is not an input of the check");
     }
 }

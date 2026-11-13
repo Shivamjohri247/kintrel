@@ -88,13 +88,13 @@ impl CiWorker {
         Ok(w)
     }
 
-    /// Approves changing the config from `trusted` (the promoted one) to `theirs`.
     /// Check runs queued or running (a gate candidate, head feedback) and deploys waiting.
     pub fn pending(&self) -> u64 {
         let w = self.want.lock().unwrap();
         w.gate.is_some() as u64 + w.feedback.is_some() as u64 + w.promoted.len() as u64
     }
 
+    /// Approves changing the config from `trusted` (the promoted one) to `theirs`.
     pub fn approve_config(&self, trusted: Option<Hash>, theirs: Option<Hash>) {
         let mut w = self.want.lock().unwrap();
         w.approved.insert((trusted, theirs));
@@ -125,8 +125,8 @@ impl CiWorker {
             if let Some((root, gseq)) = gate {
                 let incident = self.want.lock().unwrap().incident;
                 let (decision, config) = match self.policy(root) {
-                    Ok(Ok(config)) => match self.checks(root, config, &|c| c.gate || incident, false) {
-                        Ok(out) => (decide(&out.unwrap_or_default()), config),
+                    Ok(Ok(config)) => match self.checks(root, config, &|c| c.gate || incident) {
+                        Ok(out) => (decide(&out), config),
                         Err(e) => (GateState::Fail(vec![format!("kintrel.toml: {e}")]), config),
                     },
                     Ok(Err(fail)) => (fail, None),
@@ -185,8 +185,8 @@ impl CiWorker {
                 let src = kintrel_core::combine::Promoted { st: &st, root: promoted };
                 let folded = kintrel_core::combine::fold(&src, &ordered[..k]).map_err(e)?;
                 let snap = Snapshot { root: promoted, overlay: folded.files, blobs: folded.blobs.into_iter().collect() };
-                let out = self.ci.run_where(&st, &self.repo, config, &snap, &|c| c.gate || incident, false).map_err(|e| e.to_string())?;
-                let failing: Vec<Outcome> = out.unwrap_or_default().into_iter().filter(|o| !o.ok).collect();
+                let out = self.ci.run_where(&st, &self.repo, config, &snap, &|c| c.gate || incident).map_err(|e| e.to_string())?;
+                let failing: Vec<Outcome> = out.into_iter().filter(|o| !o.ok).collect();
                 Ok((!failing.is_empty()).then_some(failing))
             };
             if ordered.is_empty() || fails(0)?.is_some() {
@@ -233,7 +233,7 @@ impl CiWorker {
                 w.promotions.is_multiple_of(BACKSTOP_EVERY)
             };
             if due {
-                let out = self.checks(root, config, &|_| true, false)?.unwrap_or_default();
+                let out = self.checks(root, config, &|_| true)?;
                 let failed: Vec<Outcome> = out.into_iter().filter(|o| !o.ok).collect();
                 if !failed.is_empty() {
                     let mut w = self.want.lock().unwrap();
@@ -254,15 +254,14 @@ impl CiWorker {
 
     /// Feedback uses the promoted config only.
     fn tiers(&self, root: Hash, keep: &dyn Fn(&kintrel_ci::Check) -> bool) {
-        let r = self.reader().and_then(|st| promoted_config(&st)).and_then(|config| self.checks(root, config, keep, false));
+        let r = self.reader().and_then(|st| promoted_config(&st)).and_then(|config| self.checks(root, config, keep));
         if let Err(e) = r {
             tracing::error!("{e}");
         }
     }
 
     fn reader(&self) -> Result<kintrel_core::state::State, String> {
-        kintrel_core::state::State::open_with_log(&kintrel_core::board::state_db(&self.repo), &kintrel_core::board::log_db(&self.repo))
-            .map_err(|e| e.to_string())
+        kintrel_core::state::State::open_board(&self.repo).map_err(|e| e.to_string())
     }
 
     /// The config to judge `root` with: the promoted one, or the candidate's own if a person
@@ -278,25 +277,29 @@ impl CiWorker {
         }
     }
 
-    /// Runs (or with `cached_only`, looks up) the checks `keep` selects on `root`, reporting
-    /// failures.
-    fn checks(
-        &self,
-        root: Hash,
-        config: Option<Hash>,
-        keep: &dyn Fn(&kintrel_ci::Check) -> bool,
-        cached_only: bool,
-    ) -> Result<Option<Vec<Outcome>>, String> {
-        let st = self.reader()?;
+    /// Runs the checks `keep` selects on `root`, reporting failures.
+    fn checks(&self, root: Hash, config: Option<Hash>, keep: &dyn Fn(&kintrel_ci::Check) -> bool) -> Result<Vec<Outcome>, String> {
         let snap = Snapshot { root, ..Default::default() };
-        let out = self.ci.run_where(&st, &self.repo, config, &snap, keep, cached_only).map_err(|e| e.to_string())?;
-        if let (Some(out), Some(report)) = (&out, self.report.get()) {
-            let failed: Vec<Outcome> = out.iter().filter(|o| !o.ok).cloned().collect();
-            if !failed.is_empty() {
-                report(failed);
-            }
+        let out = self.ci.run_where(&self.reader()?, &self.repo, config, &snap, keep).map_err(|e| e.to_string())?;
+        self.report_failed(&out);
+        Ok(out)
+    }
+
+    /// Like `checks`, but only if every one is cached: `None` otherwise, and nothing runs.
+    fn cached_checks(&self, root: Hash, config: Option<Hash>, keep: &dyn Fn(&kintrel_ci::Check) -> bool) -> Result<Option<Vec<Outcome>>, String> {
+        let snap = Snapshot { root, ..Default::default() };
+        let out = self.ci.cached_where(&self.reader()?, &self.repo, config, &snap, keep).map_err(|e| e.to_string())?;
+        if let Some(out) = &out {
+            self.report_failed(out);
         }
         Ok(out)
+    }
+
+    fn report_failed(&self, out: &[Outcome]) {
+        let failed: Vec<Outcome> = out.iter().filter(|o| !o.ok).cloned().collect();
+        if let (false, Some(report)) = (failed.is_empty(), self.report.get()) {
+            report(failed);
+        }
     }
 }
 
@@ -332,7 +335,7 @@ impl Gate for CiWorker {
             return d.clone();
         }
         let incident = self.want.lock().unwrap().incident;
-        let decision = match self.checks(root, config, &|c| c.gate || incident, true) {
+        let decision = match self.cached_checks(root, config, &|c| c.gate || incident) {
             Ok(Some(out)) => decide(&out),
             Ok(None) => {
                 self.want.lock().unwrap().gate = Some((root, gseq));

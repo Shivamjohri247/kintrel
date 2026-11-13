@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use kintrel::daemon::{self, Options};
 use kintrel::rpc::Client;
 use kintrel_core::log::Durability;
-use kintrel_core::proto::{self, FileWrite, Inbox, Notice, Notices, Post, Posted, ReadFile, SessionStart, SessionStarted, StatusInfo};
+use kintrel_core::proto::{self, FileWrite, Inbox, Notice, NoticeKind, Notices, Post, Posted, ReadFile, SessionStart, SessionStarted, StatusInfo};
 
 const A: &str = "def price(x):\n    return x\n\n\ndef fee():\n    return 1\n";
 
@@ -39,8 +39,8 @@ async fn inbox(c: &mut Client, token: &str) -> Vec<Notice> {
     n.notices
 }
 
-fn kinds(n: &[Notice]) -> Vec<(String, String)> {
-    n.iter().map(|n| (n.kind.clone(), n.atom.clone())).collect()
+fn kinds(n: &[Notice]) -> Vec<(NoticeKind, String)> {
+    n.iter().map(|n| (n.kind, n.atom.clone())).collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -66,7 +66,7 @@ async fn notices_reach_readers_dependents_and_losers() {
     post(&mut c, &tc, "shop.py", "def checkout():\n    return price(3)\n").await;
     post(&mut b, &tb, "a.py", &A.replace("return 1", "return 2")).await;
     let got = inbox(&mut a, &ta).await;
-    assert_eq!(kinds(&got), [("body_changed".into(), "a.py::def fee".into())]);
+    assert_eq!(kinds(&got), [(NoticeKind::BodyChanged, "a.py::def fee".into())]);
     assert_eq!(got[0].by.as_ref().unwrap().agent, "b");
     assert_eq!((got[0].before.as_deref(), got[0].after.as_deref()), (None, None), "no signatures for a body change");
     assert!(inbox(&mut c, &tc).await.is_empty(), "c never touched a.py and fee's signature did not change");
@@ -76,11 +76,11 @@ async fn notices_reach_readers_dependents_and_losers() {
     let v2 = A.replace("return 1", "return 2");
     post(&mut b, &tb, "a.py", &v2.replace("def price(x):", "def price(x, currency):")).await;
     let got = inbox(&mut a, &ta).await;
-    assert_eq!(kinds(&got), [("interface_changed".into(), "a.py::def price".into())]);
+    assert_eq!(kinds(&got), [(NoticeKind::InterfaceChanged, "a.py::def price".into())]);
     assert_eq!(got[0].before.as_deref(), Some("def price(x):"));
     assert_eq!(got[0].after.as_deref(), Some("def price(x, currency):"));
     let got = inbox(&mut c, &tc).await;
-    assert_eq!(kinds(&got), [("interface_changed".into(), "a.py::def price".into())]);
+    assert_eq!(kinds(&got), [(NoticeKind::InterfaceChanged, "a.py::def price".into())]);
     assert_eq!(got[0].you_affected, ["shop.py::def checkout"]);
 
     // Two sessions on the same head edit the same line: the higher rank loses and is told why.
@@ -90,7 +90,7 @@ async fn notices_reach_readers_dependents_and_losers() {
     post(&mut e, &te, "a.py", &v3.replace("return 2", "return 30")).await;
     post(&mut d, &td, "a.py", &v3.replace("return 2", "return 20")).await;
     let got = inbox(&mut e, &te).await;
-    let conflict = got.iter().find(|n| n.kind == "conflict").expect("e lost");
+    let conflict = got.iter().find(|n| n.kind == NoticeKind::Conflict).expect("e lost");
     assert_eq!(conflict.atom, "a.py::def fee");
     assert_eq!(conflict.kept.as_deref(), Some("def fee():\n    return 20"));
     assert_eq!(conflict.theirs.as_deref(), Some("def fee():\n    return 30"));
@@ -116,7 +116,7 @@ async fn notices_reach_readers_dependents_and_losers() {
     inbox(&mut d, &td).await;
     post(&mut g, &tg, "a.py", &v4.replace("return 20", "return 21")).await;
     let n: Notices = g.call(proto::INBOX, &Inbox { token: tg.clone() }).await.unwrap();
-    assert_eq!(kinds(&n.notices), [("deleted".into(), "a.py::def price".into())]);
+    assert_eq!(kinds(&n.notices), [(NoticeKind::Deleted, "a.py::def price".into())]);
 
     // k's view predates d changing fee's signature. k never touches a.py: it writes a new file
     // that calls fee(). It is told at once (B4: the usual way agents depend on each other).
@@ -125,7 +125,7 @@ async fn notices_reach_readers_dependents_and_losers() {
     inbox(&mut d, &td).await;
     post(&mut k, &tk, "bill.py", "def bill():\n    return fee()\n").await;
     let n: Notices = k.call(proto::INBOX, &Inbox { token: tk.clone() }).await.unwrap();
-    assert_eq!(kinds(&n.notices), [("interface_changed".into(), "a.py::def fee".into())]);
+    assert_eq!(kinds(&n.notices), [(NoticeKind::InterfaceChanged, "a.py::def fee".into())]);
     assert_eq!(n.notices[0].you_affected, ["bill.py::def bill"]);
     assert_eq!(n.notices[0].after.as_deref(), Some("def fee(rate):"));
 
@@ -136,7 +136,7 @@ async fn notices_reach_readers_dependents_and_losers() {
     inbox(&mut d, &td).await;
     post(&mut m, &tm, "tax.py", "def tax():\n    return fee(2)\n").await;
     let n: Notices = m.call(proto::INBOX, &Inbox { token: tm.clone() }).await.unwrap();
-    assert_eq!(kinds(&n.notices), [("body_changed".into(), "a.py::def fee".into())]);
+    assert_eq!(kinds(&n.notices), [(NoticeKind::BodyChanged, "a.py::def fee".into())]);
     assert_eq!(n.notices[0].you_affected, ["tax.py::def tax"]);
 
     std::fs::remove_dir_all(kintrel_core::board::runtime_dir(&repo).unwrap()).ok();
@@ -161,7 +161,7 @@ async fn claims_over_rpc() {
     let claim = |token: &str, targets: &[&str]| proto::Announce {
         token: token.into(),
         summary: "fee rework".into(),
-        targets: targets.iter().map(|t| t.to_string()).collect(),
+        targets: targets.iter().map(ToString::to_string).collect(),
         lease_ms: None,
     };
     let r: proto::Announced = a.call(proto::CLAIM, &claim(&ta, &["a.py::def fee"])).await.unwrap();
@@ -171,9 +171,9 @@ async fn claims_over_rpc() {
 
     post(&mut b, &tb, "a.py", &A.replace("return 1", "return 2")).await;
     let got = inbox(&mut b, &tb).await;
-    let n = got.iter().find(|n| n.kind == "claim_overlap").expect("b is told about a's claim");
+    let n = got.iter().find(|n| n.kind == NoticeKind::ClaimOverlap).expect("b is told about a's claim");
     assert_eq!((n.atom.as_str(), n.summary.as_deref()), ("a.py::def fee", Some("fee rework")));
-    assert!(inbox(&mut a, &ta).await.iter().any(|n| n.kind == "claim_overlap"));
+    assert!(inbox(&mut a, &ta).await.iter().any(|n| n.kind == NoticeKind::ClaimOverlap));
 
     let _: proto::Status = a.call(proto::RELEASE, &proto::Release { token: ta.clone(), id: r.id }).await.unwrap();
     let _: proto::Status = a.call(proto::SESSION_END, &proto::SessionRef { token: ta.clone() }).await.unwrap();

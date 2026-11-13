@@ -14,7 +14,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use kintrel_core::state::State;
@@ -76,7 +76,7 @@ impl Snapshot {
     fn blob(&self, st: &State, id: Hash) -> Result<Vec<u8>> {
         match self.blobs.get(&id) {
             Some(b) => Ok(b.clone()),
-            None => Ok(st.get_blob(id)?.ok_or_else(|| kintrel_core::Error::Corrupt(format!("missing blob {id}")))?),
+            None => Ok(st.blob(id)?),
         }
     }
 }
@@ -120,6 +120,25 @@ struct Job<'a> {
     key: Hash,
 }
 
+impl Job<'_> {
+    /// This job's outcome, not cached, not timed out.
+    fn outcome(&self, ok: bool, output: String) -> Outcome {
+        Outcome {
+            check: self.check.name.clone(),
+            tier: self.check.tier,
+            target: self.target.clone(),
+            ok,
+            cached: false,
+            timed_out: false,
+            infra_error: false,
+            ms: 0,
+            output,
+            key: self.key,
+            inputs: self.check.inputs.clone(),
+        }
+    }
+}
+
 pub struct Ci {
     db: Mutex<Connection>,
     /// Tool-version command → its output, memoized per daemon (SPEC §10.2).
@@ -137,20 +156,28 @@ impl Ci {
              CREATE TABLE IF NOT EXISTS results (key BLOB PRIMARY KEY, check_name TEXT, target TEXT,
                  ok INTEGER, output TEXT, ms INTEGER, at INTEGER) WITHOUT ROWID;",
         )?;
-        let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let jobs = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         Ok(Ci { db: Mutex::new(conn), tools: Mutex::new(HashMap::new()), facts: Mutex::new(HashMap::new()), jobs })
     }
 
     /// Runs the checks of `config` (a `kintrel.toml` blob, see [`config_of`]) on the snapshot,
     /// only `tier`'s if given, reusing cached results. Without a config there is nothing to run.
     pub fn run(&self, st: &State, repo: &Path, config: Option<Hash>, snap: &Snapshot, tier: Option<Tier>) -> Result<Vec<Outcome>> {
-        let out = self.run_where(st, repo, config, snap, &|c: &Check| tier.is_none_or(|t| c.tier == t), false)?;
-        Ok(out.expect("runs when not cached-only"))
+        self.run_where(st, repo, config, snap, &|c: &Check| tier.is_none_or(|t| c.tier == t))
     }
 
-    /// Like [`Ci::run`] for the checks `keep` selects. With `cached_only`, nothing runs: the
-    /// result is `None` unless every selected check is cached (the gate's fast path).
-    pub fn run_where(
+    /// Like [`Ci::run`] for the checks `keep` selects.
+    pub fn run_where(&self, st: &State, repo: &Path, config: Option<Hash>, snap: &Snapshot, keep: &dyn Fn(&Check) -> bool) -> Result<Vec<Outcome>> {
+        Ok(self.outcomes(st, repo, config, snap, keep, false)?.expect("runs when not cached-only"))
+    }
+
+    /// The cached outcomes of the checks `keep` selects, or `None` unless every one is cached;
+    /// nothing runs (the gate's fast path).
+    pub fn cached_where(&self, st: &State, repo: &Path, config: Option<Hash>, snap: &Snapshot, keep: &dyn Fn(&Check) -> bool) -> Result<Option<Vec<Outcome>>> {
+        self.outcomes(st, repo, config, snap, keep, true)
+    }
+
+    fn outcomes(
         &self,
         st: &State,
         repo: &Path,
@@ -232,9 +259,7 @@ impl Ci {
             // turn out to interfere through files they write.
             fs::remove_dir_all(&dir).ok();
             for (i, o) in done.into_inner().unwrap() {
-                if !o.timed_out && !o.infra_error {
-                    self.store(&o)?;
-                }
+                self.store(&o)?;
                 out[i] = Some(o);
             }
         }
@@ -278,9 +303,7 @@ impl Ci {
                         None => dir.insert(checkout(st, repo, &snap)?),
                     };
                     let o = execute(&job, d, repo);
-                    if !o.timed_out && !o.infra_error {
-                        self.store(&o)?;
-                    }
+                    self.store(&o)?;
                     o
                 }
             };
@@ -306,23 +329,15 @@ impl Ci {
             kintrel_core::metrics::CHECKS_RUN.add(1);
             kintrel_core::metrics::CHECKS_CACHED.add(1);
         }
-        Ok(row.map(|(ok, output, ms)| Outcome {
-            check: job.check.name.clone(),
-            tier: job.check.tier,
-            target: job.target.clone(),
-            ok,
-            cached: true,
-            timed_out: false,
-            infra_error: false,
-            ms,
-            output,
-            key: job.key,
-            inputs: job.check.inputs.clone(),
-        }))
+        Ok(row.map(|(ok, output, ms)| Outcome { cached: true, ms, ..job.outcome(ok, output) }))
     }
 
+    /// Records a verdict on the code. Timeouts and infrastructure errors are not verdicts.
     fn store(&self, o: &Outcome) -> Result<()> {
-        let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        if o.timed_out || o.infra_error {
+            return Ok(());
+        }
+        let at = kintrel_core::now_ms() as i64;
         self.db.lock().unwrap().execute(
             "INSERT OR REPLACE INTO results (key, check_name, target, ok, output, ms, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![&o.key.0[..], o.check, o.target, o.ok, o.output, o.ms, at],
@@ -433,7 +448,7 @@ fn env_values(check: &Check) -> Vec<(String, Option<String>)> {
 fn launch(cmd: &str, check: &Check, dir: Option<&Path>, repo: &Path) -> std::result::Result<sandbox::Running, String> {
     let mut env: Vec<(String, std::ffi::OsString)> = BASE_ENV
         .iter()
-        .map(|n| n.to_string())
+        .map(ToString::to_string)
         .chain(check.env.iter().cloned())
         .filter_map(|n| std::env::var_os(&n).map(|v| (n, v)))
         .collect();
@@ -547,21 +562,7 @@ fn execute_uncounted(job: &Job, dir: &Path, repo: &Path) -> Outcome {
     let start = Instant::now();
     let cmd = match cmd {
         Ok(cmd) => cmd,
-        Err(why) => {
-            return Outcome {
-                check: job.check.name.clone(),
-                tier: job.check.tier,
-                target: job.target.clone(),
-                ok: false,
-                cached: false,
-                timed_out: false,
-                infra_error: false,
-                ms: 0,
-                output: why,
-                key: job.key,
-                inputs: job.check.inputs.clone(),
-            };
-        }
+        Err(why) => return job.outcome(false, why),
     };
     let timeout = job.check.timeout_s.map_or(DEFAULT_TIMEOUT, Duration::from_secs);
     let mut timed_out = false;
@@ -590,21 +591,8 @@ fn execute_uncounted(job: &Job, dir: &Path, repo: &Path) -> Outcome {
             (status == Some(true), output)
         }
     };
-    Outcome {
-        check: job.check.name.clone(),
-        tier: job.check.tier,
-        target: job.target.clone(),
-        ok,
-        cached: false,
-        timed_out,
-        infra_error,
-        ms: start.elapsed().as_millis() as u64,
-        output,
-        key: job.key,
-        inputs: job.check.inputs.clone(),
-    }
+    Outcome { timed_out, infra_error, ms: start.elapsed().as_millis() as u64, ..job.outcome(ok, output) }
 }
-
 
 /// The snapshot's files: the root's, with the overlay applied.
 fn snapshot_files(st: &State, snap: &Snapshot) -> Result<BTreeMap<String, (Kind, Hash)>> {

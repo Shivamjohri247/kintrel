@@ -107,6 +107,26 @@ pub enum Tier {
     Test,
 }
 
+impl Tier {
+    pub const ALL: [Tier; 3] = [Tier::Lint, Tier::Typecheck, Tier::Test];
+
+    /// The name `kintrel.toml` and the protocol use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Lint => "lint",
+            Tier::Typecheck => "typecheck",
+            Tier::Test => "test",
+        }
+    }
+}
+
+impl std::str::FromStr for Tier {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Tier, String> {
+        Tier::ALL.into_iter().find(|t| t.name() == s).ok_or_else(|| format!("unknown tier {s:?}"))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
