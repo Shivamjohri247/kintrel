@@ -187,7 +187,8 @@ inputs = ["**"]
 [[check]]
 name = "loopback"
 scope = "repo"
-run = "python3 -m http.server 8799 --bind 127.0.0.1 >/dev/null 2>&1 & s=$!; sleep 1; curl -sf -o /dev/null http://127.0.0.1:8799/; r=$?; kill $s; exit $r"
+# Retries while the server starts: a fixed wait flakes on a slow runner.
+run = "python3 -m http.server 8799 --bind 127.0.0.1 >/dev/null 2>&1 & s=$!; r=1; for i in $(seq 100); do curl -sf -o /dev/null http://127.0.0.1:8799/ && {{ r=0; break; }}; sleep 0.1; done; kill $s; exit $r"
 inputs = ["**"]
 
 [[check]]
